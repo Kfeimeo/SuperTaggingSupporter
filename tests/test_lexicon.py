@@ -65,7 +65,7 @@ def test_direct_dictionary_parsing_and_failure_attribution():
     assert filtered["reason"] == "empty_support"
 
 
-def test_eval_cli_custom_jsonl_does_not_import_tagger(tmp_path, monkeypatch):
+def test_eval_cli_custom_jsonl_does_not_import_tagger(tmp_path, monkeypatch, capsys):
     lexpath = tmp_path / "lex.json"
     make_lexicon().save(lexpath)
     corpus = tmp_path / "custom.jsonl"
@@ -74,6 +74,8 @@ def test_eval_cli_custom_jsonl_does_not_import_tagger(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "stsupport.supertagger", None)
     assert main(["eval-lexicon", "--lexicon", str(lexpath), "--corpus", str(corpus),
                  "--set", f"output.dir={tmp_path.as_posix()}", "--set", "output.name=custom_eval"]) == 0
+    terminal = capsys.readouterr().err
+    assert "[CPU] Parse sentences" in terminal and "100%" in terminal and "3/3" in terminal
     summary = json.loads((tmp_path / "custom_eval.summary.json").read_text())
     assert summary["parse_rate_all"] == pytest.approx(1 / 3)
     assert summary["parse_rate_covered_eligible"] == 0.5
@@ -85,6 +87,9 @@ def test_eval_cli_custom_jsonl_does_not_import_tagger(tmp_path, monkeypatch):
         main(["eval-lexicon", "--lexicon", str(lexpath), "--corpus", str(corpus),
               "--set", f"output.dir={tmp_path.as_posix()}", "--set", "output.name=custom"])
     assert corpus.read_bytes() == original
+    assert main(["eval-lexicon", "--lexicon", str(lexpath), "--corpus", str(corpus), "--no-progress",
+                 "--set", f"output.dir={tmp_path.as_posix()}", "--set", "output.name=custom_no_progress"]) == 0
+    assert "[CPU] Parse sentences" not in capsys.readouterr().err
 
 
 def test_streaming_corpus_limits(tmp_path):

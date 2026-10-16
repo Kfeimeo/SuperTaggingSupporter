@@ -61,3 +61,18 @@ def test_story_offsets_resume_inline_markers_and_utf8(tmp_path):
     assert [text for text, _ in records] == ["First café.", "Second story.", "Third."]
     for index, (_, offset) in enumerate(records):
         assert list(runner.stories(path, offset)) == records[index + 1:]
+
+
+def test_child_progress_is_visible_and_logged(tmp_path, monkeypatch, capsys):
+    import subprocess
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    import run_full_tinystories_experiment as runner
+    log = tmp_path / "cpu.log"
+    runner.run_logged([sys.executable, "-c", "import sys; sys.stderr.write('CPU: 0%\\rCPU: 100%\\n'); print('summary')"], log)
+    terminal = capsys.readouterr().err
+    assert "CPU: 100%" in terminal and "summary" in terminal
+    assert b"0%\rCPU: 100%" in log.read_bytes()
+    with pytest.raises(subprocess.CalledProcessError):
+        runner.run_logged([sys.executable, "-c", "import sys; print('parser failed'); sys.exit(2)"], tmp_path / "failed.log")
+    assert "parser failed" in (tmp_path / "failed.log").read_text()

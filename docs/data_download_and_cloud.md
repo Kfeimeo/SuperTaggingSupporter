@@ -177,6 +177,36 @@ python scripts/report_full_tinystories_experiment.py
 它的 `--batch-size 128` 只调整 GPU 超标注，不会改变内部 CPU 解析配置。
 上面的独立 `eval-lexicon` 命令可用于按云主机资源重新测评。
 
+## 6. 阶段标签与 tqdm 进度条
+
+全量命令自动打印以下阶段，并在 GPU、CPU 阶段显示各自的 tqdm 进度条：
+
+```text
+[1/4 PREPARE] Verify source data and load GPU model
+[2/4 GPU] Source processed: ...% .../1.92G ... [stories=..., sentences=..., batch=...]
+[3/4 CPU] Parse Brown news using the fixed global lexicon
+[CPU] Parse sentences: ...% .../4588 ... [parsed=..., failed=..., skipped=...]
+[4/4 REPORT] Generate experiment report
+[COMPLETE] All experiment stages finished
+```
+
+GPU 总进度按源文件已完成并提交检查点的字节量计，不代表故事数或句数百分比；
+右侧还显示当前组的超标注句子进度。恢复运行时总进度从已保存偏移继续，ETA 按恢复后的处理速度估计。
+CPU 总进度按目标语料的有效句数计，包括解析失败、OOV 和超长跳过的句子，按批次完成后更新。
+CPU 开始前会先扫描目标语料以确定总句数，不会一次将整个语料载入内存。
+单批解析尚未完成时，CPU 进度条会暂时停留在上一批的计数。
+
+自动调用的 CPU 子进程输出会实时显示在终端，同时保存在
+`output/brown_news_full_global_lexicon.log`。GPU 的 JSON 检查点日志和状态文件仍然保留。
+使用 `nohup` 时，进度输出进入重定向日志，可用 `tail -f` 查看。
+
+如只需要普通阶段日志，可关闭进度条：
+
+```bash
+python -u scripts/run_full_tinystories_experiment.py --data-dir /mnt/datasets --batch-size 128 --no-progress
+python -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlite --corpus /mnt/datasets/brown_news.jsonl --set output.name=brown_news_full_global_lexicon --no-progress
+```
+
 ## 验证范围
 
 已测试续传、服务端忽略 Range、短响应重试、错误 Range、哈希失败、完整 partial 恢复、

@@ -6,6 +6,7 @@ Interrupted groups are replayed without duplicating committed soft counts.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ from itertools import islice
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 from download_tinystories import SHA256, download
 from stsupport.corpus import sentence_splitter_name, split_sentences, tokenize
@@ -24,6 +26,23 @@ from stsupport.lexicon import GlobalLexicon
 from stsupport.supertagger import HolCCGSupertagger
 
 MARKER = b"<|endoftext|>"
+
+
+def run_logged(command, log_path):
+    """Keep child progress visible, preserving carriage returns in its log."""
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    with Path(log_path).open("w", encoding="utf-8", newline="") as log:
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env) as process:
+            with io.TextIOWrapper(process.stdout, encoding="utf-8", errors="replace", newline="") as stream:
+                while char := stream.read(1):
+                    log.write(char)
+                    sys.stderr.write(char)
+                    if char in "\r\n":
+                        log.flush()
+                        sys.stderr.flush()
+            code = process.wait()
+            if code:
+                raise subprocess.CalledProcessError(code, command)
 
 
 def stories(path, offset=0):
@@ -116,6 +135,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--stories-per-checkpoint", type=int, default=128)
     parser.add_argument("--data-dir", type=Path, default=None, help="contains raw/TinyStories-train.txt and brown_news.jsonl")
+    parser.add_argument("--no-progress", action="store_true", help="disable tqdm bars; retain stage messages and checkpoint logs")
     args = parser.parse_args()
     if args.batch_size < 1 or args.stories_per_checkpoint < 1:
         raise ValueError("batch and checkpoint sizes must be positive")
@@ -129,7 +149,9 @@ def main():
     lock = FileLock(output / "tinystories_full.run.lock")
     lock.acquire(timeout=0)
     state_path = output / "tinystories_full.status.json"
+    gpu_bar = None
     try:
+        print("[1/4 PREPARE] Verify source data and load GPU model", flush=True)
         if not args.benchmark_only:
             write_status(state_path, {"stage": "verifying_source", "pid": os.getpid()})
         path = download(root, output_dir=data_dir / "raw")
@@ -164,6 +186,11 @@ def main():
         stream = stories(path, progress["offset"])
         elapsed_base = progress["elapsed_seconds"]
         run_start = time.perf_counter()
+        print("[2/4 GPU] Supertag source stories and build global lexicon", flush=True)
+        gpu_bar = tqdm(total=path.stat().st_size, initial=progress["offset"],
+                       desc="[2/4 GPU] Source processed", unit="B", unit_scale=True,
+                       dynamic_ncols=True, mininterval=1, disable=args.no_progress)
+        last_gpu_refresh = time.monotonic()
         while group := list(islice(stream, args.stories_per_checkpoint)):
             sentences = []
             for text, _ in group:
@@ -182,6 +209,11 @@ def main():
                     raise ValueError("tagger sentence count mismatch")
                 for tokens, probs in zip(batch, distributions):
                     delta.add(tokens, probs, k=8, beta=0.99, exclude=tagger.excluded_ids)
+                gpu_bar.set_postfix(stories=progress["stories"], sentences=progress["sentences"],
+                                    batch=f"{min(start + len(batch), len(sentences))}/{len(sentences)}", refresh=False)
+                if time.monotonic() - last_gpu_refresh >= 1:
+                    gpu_bar.refresh()
+                    last_gpu_refresh = time.monotonic()
             progress["stories"] += len(group)
             progress["sentences"] += len(sentences)
             progress["offset"] = group[-1][1]
@@ -193,10 +225,17 @@ def main():
             if progress["offset"]:
                 current["estimated_remaining_hours"] = progress["elapsed_seconds"] / progress["offset"] * (path.stat().st_size - progress["offset"]) / 3600
             write_status(state_path, current)
-            print(json.dumps(current), flush=True)
+            gpu_bar.update(progress["offset"] - gpu_bar.n)
+            gpu_bar.set_postfix(stories=progress["stories"], sentences=progress["sentences"],
+                                words=current["word_types"], refresh=False)
+            tqdm.write(json.dumps(current), file=sys.stdout)
         progress["complete"] = True
         progress["offset"] = path.stat().st_size
         store.commit(GlobalLexicon(tagger.categories), progress)
+        gpu_bar.update(path.stat().st_size - gpu_bar.n)
+        gpu_bar.close()
+        gpu_bar = None
+        print("[2/4 LEXICON] Save complete lexicon and export category map", flush=True)
         summary = {**progress, **store.summary(), "metadata": metadata}
         (output / "tinystories_full.lexicon.summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         store.export_map(output / "tinystories_full.lexicon.map.json")
@@ -207,20 +246,25 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         write_status(state_path, {**summary, "stage": "evaluating_brown_news", "pid": os.getpid()})
-        with (output / "brown_news_full_global_lexicon.log").open("w", encoding="utf-8") as log:
-            subprocess.run([sys.executable, "-u", "-m", "stsupport", "eval-lexicon",
+        print("[3/4 CPU] Parse Brown news using the fixed global lexicon", flush=True)
+        run_logged([sys.executable, "-u", "-m", "stsupport", "eval-lexicon",
                             "--lexicon", "output/tinystories_full.lexicon.sqlite", "--corpus", str(brown_corpus),
                             "--format", "jsonl", "--set", "output.name=brown_news_full_global_lexicon",
-                            "--set", "search.n_threads=4", "--batch-size", "4"], stdout=log, stderr=subprocess.STDOUT, check=True)
+                            "--set", "search.n_threads=4", "--batch-size", "4"]
+                   + (["--no-progress"] if args.no_progress else []), output / "brown_news_full_global_lexicon.log")
         # A separate report step can also be rerun independently after completion.
+        print("[4/4 REPORT] Generate experiment report", flush=True)
         subprocess.run([sys.executable, "scripts/report_full_tinystories_experiment.py"], check=True)
         write_status(state_path, {**summary, "stage": "complete", "pid": os.getpid()})
+        print("[COMPLETE] All experiment stages finished", flush=True)
     except BaseException as error:
         if not args.benchmark_only:
             write_status(state_path, {"stage": "failed", "pid": os.getpid(), "error": repr(error),
                                       "resume": "python -u scripts/run_full_tinystories_experiment.py"})
         raise
     finally:
+        if gpu_bar is not None:
+            gpu_bar.close()
         lock.release()
 
 

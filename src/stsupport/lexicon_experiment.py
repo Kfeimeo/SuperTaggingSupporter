@@ -9,6 +9,7 @@ from collections import Counter
 from dataclasses import asdict
 from itertools import islice
 from pathlib import Path
+from tqdm import tqdm
 
 from stsupport.config import dump_config, load_config
 from stsupport.corpus import iter_corpus
@@ -151,8 +152,12 @@ def cmd_eval_lexicon(args):
     counts, reasons, oov_counts = Counter(), Counter(), Counter()
     types = set()
     candidate_pairs = 0
+    logger.info("[CPU] Counting target sentences for parsing progress")
+    target_total = sum(1 for _ in _stream(cfg))
     t0 = time.perf_counter()
-    with Path(f"{prefix}.jsonl").open("w", encoding="utf-8") as jsonl, \
+    with tqdm(total=target_total, desc="[CPU] Parse sentences", unit="sent", dynamic_ncols=True,
+              mininterval=1, disable=args.no_progress) as bar, \
+            Path(f"{prefix}.jsonl").open("w", encoding="utf-8") as jsonl, \
             Path(f"{prefix}.auto").open("w", encoding="utf-8") as auto:
         for chunk in _batches(_stream(cfg), args.batch_size):
             records = evaluate_batch(engine, lex, chunk, max_tokens=cfg.search.max_tokens,
@@ -178,8 +183,11 @@ def cmd_eval_lexicon(args):
                 if cfg.output.write_auto:
                     auto.write(f"ID={record['id']} PARSER=GLOBALLEXICON STATUS={record['status']} "
                                f"NUMPARSE={int(record['status'] == 'parsed')}\n{record['auto'] or ''}\n")
-            logger.info("evaluated %d sentences: %d parsed, %d failed, %d skipped", counts["sentences"],
-                        counts["parsed"], counts["fail"], counts["skipped"])
+            bar.set_postfix(parsed=counts["parsed"], failed=counts["fail"], skipped=counts["skipped"], refresh=False)
+            bar.update(len(records))
+            if args.no_progress:
+                logger.info("[CPU] evaluated %d/%d sentences: %d parsed, %d failed, %d skipped", counts["sentences"],
+                            target_total, counts["parsed"], counts["fail"], counts["skipped"])
     def ratio(n, d):
         return n / d if d else None
 
@@ -231,6 +239,7 @@ def register_commands(sub):
             command.add_argument("--lowercase", action="store_true", help="merge case variants in word lookup")
             command.add_argument("--device", default=None)
         else:
+            command.add_argument("--no-progress", action="store_true", help="disable CPU parsing tqdm bar")
             command.add_argument("--min-support", type=int, default=1, help="minimum selected occurrences of each word-category pair")
             command.add_argument("--weighting", choices=["mean", "uniform"], default="mean")
             command.add_argument("--batch-size", type=int, default=16, help="sentences per parser batch")
