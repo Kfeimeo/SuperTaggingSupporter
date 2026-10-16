@@ -129,6 +129,54 @@ python -m stsupport run --corpus /mnt/datasets/brown_news.jsonl --k 8 --beta 0.9
 python scripts/report_full_tinystories_experiment.py
 ```
 
+## 5. GPU batch size 与 CPU 解析线程参数
+
+这两个阶段的批量分别配置，单位均为句子数：
+
+| 命令 | 参数 | 作用与默认值 |
+| --- | --- | --- |
+| `run_full_tinystories_experiment.py` | `--batch-size N` | GPU 超标注每批句数，默认 64 |
+| `stsupport run` / `build-lexicon` | `--set tagger.batch_size=N` | GPU 超标注每批句数，默认 32 |
+| `stsupport eval-lexicon` | `--set search.n_threads=N` | C++ 句子间并行解析线程数；不加载配置文件时默认 0，自动使用硬件线程数 |
+| `stsupport eval-lexicon` | `--batch-size N` | 每批提交的目标句数，默认 16；限制该批可用并行度 |
+
+配置文件或已有 `--set` 设置可以覆盖上述配置项的默认值。
+
+### GPU：增大超标注 batch size
+
+例如在 GPU 主机上每批处理 128 句：
+
+```bash
+python -u scripts/run_full_tinystories_experiment.py --data-dir /mnt/datasets --batch-size 128 --stories-per-checkpoint 128
+```
+
+显存充足时可以继续尝试 256。全量脚本遇到 CUDA 显存不足会拆小批重试，因此实际每批句数可能小于指定值。
+增大批量不保证同比加速，效果受句长、padding 和 GPU 性能影响。
+`--stories-per-checkpoint` 控制检查点提交间隔，不是 GPU batch size。
+
+普通超标注参考组使用配置覆盖参数：
+
+```bash
+python -m stsupport run --corpus /mnt/datasets/brown_news.jsonl --k 8 --beta 0.99 --set corpus.format=jsonl --set tagger.batch_size=128 --set search.n_threads=16 --set output.name=brown_news_contextual_reference
+```
+
+### CPU：增加句子间并行解析
+
+全量词典构建完成后，可以单独用 16 个线程、每批 64 句测评：
+
+```bash
+python -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlite --corpus /mnt/datasets/brown_news.jsonl --format jsonl --set search.n_threads=16 --batch-size 64 --set output.name=brown_news_full_global_lexicon
+python scripts/report_full_tinystories_experiment.py
+```
+
+`search.n_threads=0` 会自动使用硬件线程数。每个线程独立解析一个句子，单句内部的 CKY 计算仍是单线程。
+实际并行数不超过线程数和当批实际需要解析的句数；OOV 或句长超限的句子不会进入解析。
+增加线程会同时增加图表内存占用。
+
+**当前全量脚本内部自动测评仍固定为 4 个线程、每批 4 句。**
+它的 `--batch-size 128` 只调整 GPU 超标注，不会改变内部 CPU 解析配置。
+上面的独立 `eval-lexicon` 命令可用于按云主机资源重新测评。
+
 ## 验证范围
 
 已测试续传、服务端忽略 Range、短响应重试、错误 Range、哈希失败、完整 partial 恢复、
