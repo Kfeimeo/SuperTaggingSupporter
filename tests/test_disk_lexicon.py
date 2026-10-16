@@ -76,3 +76,20 @@ def test_child_progress_is_visible_and_logged(tmp_path, monkeypatch, capsys):
     with pytest.raises(subprocess.CalledProcessError):
         runner.run_logged([sys.executable, "-c", "import sys; print('parser failed'); sys.exit(2)"], tmp_path / "failed.log")
     assert "parser failed" in (tmp_path / "failed.log").read_text()
+
+
+def test_full_workflow_forwards_cpu_options_independently(monkeypatch):
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    import run_full_tinystories_experiment as runner
+    args = runner.parse_args(["--batch-size", "128", "--parse-threads", "16", "--parse-batch-size", "64", "--no-progress"])
+    command = runner.cpu_command("target.jsonl", args.parse_threads, args.parse_batch_size, args.no_progress)
+    assert args.batch_size == 128
+    assert "search.n_threads=16" in command
+    assert command[command.index("--batch-size") + 1] == "64"
+    assert "--no-progress" in command
+    assert runner.parse_args([]).parse_threads == 4
+    assert runner.parse_args(["--parse-threads", "0"]).parse_threads == 0
+    for invalid in (["--parse-threads", "-1"], ["--parse-batch-size", "0"]):
+        with pytest.raises(SystemExit):
+            runner.parse_args(invalid)

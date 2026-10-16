@@ -40,6 +40,9 @@ Get-Content output/tinystories_full_run.err.log -Tail 5
 python -u scripts/run_full_tinystories_experiment.py --batch-size 64 --stories-per-checkpoint 128
 ```
 
+同一条命令可以通过 `--parse-threads 16 --parse-batch-size 64` 配置后续自动执行的 CPU 阶段；
+`--batch-size` 仅控制 GPU 超标注，CPU 参数默认均为 4。
+
 脚本自带互斥锁，拒绝两个实例同时修改同一词典。数据哈希、模型路径、候选阈值和
 分句后端等设置必须与检查点相同；更换设置时应使用独立实验文件。
 如果构建已完成而后续测评失败，完整源词典仍保留，可单独重跑：

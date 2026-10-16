@@ -58,7 +58,8 @@ def main(root=None):
 
 与小样本实验相同：`k=8, beta=0.99` 候选并集、完整概率分布的算术平均、
 `min_support=1`、保留大小写、严格 OOV；目标固定为 Brown news 的 {full['sentences']:,} 句，
-语法不变、无 beam、句长上限 80、4 个解析线程。
+语法不变、无 beam、句长上限 {full.get('max_tokens', 80)}，解析线程参数为 {full.get('n_threads', 4)}
+（0 表示自动使用硬件线程数），每批 {full.get('batch_size', 4)} 句。
 FP32 神经推理使用向量化词级池化；小批验证与原实现最大概率差值记录在 benchmark 文件中。
 超过模型容量的个别源句会拆成子上下文，保留全部 token，
 累计拆分操作为 {source.get('long_sentence_chunk_operations', 0):,} 次。
@@ -100,7 +101,7 @@ python -u scripts/run_full_tinystories_experiment.py
 单独重跑测评：
 
 ```powershell
-python -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlite --corpus data/brown_news.jsonl --format jsonl --set output.name=brown_news_full_global_lexicon --set search.n_threads=4 --batch-size 4
+python -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlite --corpus data/brown_news.jsonl --format jsonl --set output.name=brown_news_full_global_lexicon --set search.n_threads={full.get('n_threads', 4)} --batch-size {full.get('batch_size', 4)}
 python scripts/report_full_tinystories_experiment.py
 ```
 

@@ -212,6 +212,7 @@ def cmd_eval_lexicon(args):
         "min_support": args.min_support, "weighting": args.weighting, "oov_policy": "strict",
         "all_dictionary_candidates_used": True, "exact_chart": cfg.grammar.cell_beam == 0,
         "max_tokens": cfg.search.max_tokens,
+        "n_threads": cfg.search.n_threads, "batch_size": args.batch_size,
     }
     Path(f"{prefix}.summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     Path(f"{prefix}.oov.json").write_text(json.dumps(dict(oov_counts.most_common()), ensure_ascii=False, indent=2), encoding="utf-8")

@@ -129,16 +129,32 @@ def benchmark(tagger, path, output):
     print(json.dumps(result, indent=2), flush=True)
 
 
-def main():
+def cpu_command(corpus, threads=4, batch_size=4, no_progress=False):
+    return [sys.executable, "-u", "-m", "stsupport", "eval-lexicon",
+            "--lexicon", "output/tinystories_full.lexicon.sqlite", "--corpus", str(corpus),
+            "--format", "jsonl", "--set", "output.name=brown_news_full_global_lexicon",
+            "--set", f"search.n_threads={threads}", "--batch-size", str(batch_size)] + (["--no-progress"] if no_progress else [])
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark-only", action="store_true")
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--parse-threads", type=int, default=4, help="CPU parser threads (default: 4; 0: hardware thread count)")
+    parser.add_argument("--parse-batch-size", type=int, default=4, help="target sentences per CPU parser batch (default: 4)")
     parser.add_argument("--stories-per-checkpoint", type=int, default=128)
     parser.add_argument("--data-dir", type=Path, default=None, help="contains raw/TinyStories-train.txt and brown_news.jsonl")
     parser.add_argument("--no-progress", action="store_true", help="disable tqdm bars; retain stage messages and checkpoint logs")
-    args = parser.parse_args()
-    if args.batch_size < 1 or args.stories_per_checkpoint < 1:
-        raise ValueError("batch and checkpoint sizes must be positive")
+    args = parser.parse_args(argv)
+    if args.batch_size < 1 or args.stories_per_checkpoint < 1 or args.parse_batch_size < 1:
+        parser.error("batch and checkpoint sizes must be positive")
+    if args.parse_threads < 0:
+        parser.error("parse-threads must be >= 0")
+    return args
+
+
+def main():
+    args = parse_args()
     root = Path(__file__).resolve().parents[1]
     data_dir = (args.data_dir or root / "data").expanduser().resolve()
     os.chdir(root)
@@ -246,12 +262,9 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         write_status(state_path, {**summary, "stage": "evaluating_brown_news", "pid": os.getpid()})
-        print("[3/4 CPU] Parse Brown news using the fixed global lexicon", flush=True)
-        run_logged([sys.executable, "-u", "-m", "stsupport", "eval-lexicon",
-                            "--lexicon", "output/tinystories_full.lexicon.sqlite", "--corpus", str(brown_corpus),
-                            "--format", "jsonl", "--set", "output.name=brown_news_full_global_lexicon",
-                            "--set", "search.n_threads=4", "--batch-size", "4"]
-                   + (["--no-progress"] if args.no_progress else []), output / "brown_news_full_global_lexicon.log")
+        print(f"[3/4 CPU] Parse Brown news (threads={args.parse_threads}, batch_size={args.parse_batch_size})", flush=True)
+        run_logged(cpu_command(brown_corpus, args.parse_threads, args.parse_batch_size, args.no_progress),
+                   output / "brown_news_full_global_lexicon.log")
         # A separate report step can also be rerun independently after completion.
         print("[4/4 REPORT] Generate experiment report", flush=True)
         subprocess.run([sys.executable, "scripts/report_full_tinystories_experiment.py"], check=True)

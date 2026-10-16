@@ -136,6 +136,8 @@ python scripts/report_full_tinystories_experiment.py
 | 命令 | 参数 | 作用与默认值 |
 | --- | --- | --- |
 | `run_full_tinystories_experiment.py` | `--batch-size N` | GPU 超标注每批句数，默认 64 |
+| `run_full_tinystories_experiment.py` | `--parse-threads N` | 自动衔接的 CPU 解析线程数，默认 4；0 为硬件线程数 |
+| `run_full_tinystories_experiment.py` | `--parse-batch-size N` | 自动衔接的 CPU 解析每批句数，默认 4 |
 | `stsupport run` / `build-lexicon` | `--set tagger.batch_size=N` | GPU 超标注每批句数，默认 32 |
 | `stsupport eval-lexicon` | `--set search.n_threads=N` | C++ 句子间并行解析线程数；不加载配置文件时默认 0，自动使用硬件线程数 |
 | `stsupport eval-lexicon` | `--batch-size N` | 每批提交的目标句数，默认 16；限制该批可用并行度 |
@@ -173,9 +175,15 @@ python scripts/report_full_tinystories_experiment.py
 实际并行数不超过线程数和当批实际需要解析的句数；OOV 或句长超限的句子不会进入解析。
 增加线程会同时增加图表内存占用。
 
-**当前全量脚本内部自动测评仍固定为 4 个线程、每批 4 句。**
-它的 `--batch-size 128` 只调整 GPU 超标注，不会改变内部 CPU 解析配置。
-上面的独立 `eval-lexicon` 命令可用于按云主机资源重新测评。
+全量流程可以用**同一条命令**配置 GPU 和 CPU 两个阶段，自动依次执行：
+
+```bash
+python -u scripts/run_full_tinystories_experiment.py --data-dir /mnt/datasets --batch-size 128 --parse-threads 16 --parse-batch-size 64 --stories-per-checkpoint 128
+```
+
+其中 GPU 每批 128 句；完成词典后自动切换至 CPU，使用 16 个线程、每批 64 句。
+不传 CPU 参数时仍默认 4 线程、每批 4 句。无需另外启动 `eval-lexicon`；上面的独立命令用于单独重跑测评。
+CPU 设置也会记录在测评摘要和最终报告中。
 
 ## 6. 阶段标签与 tqdm 进度条
 
