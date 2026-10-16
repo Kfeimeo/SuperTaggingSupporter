@@ -1,0 +1,31 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "stsupport"
+version = "0.1.0"
+description = "Supertagging support: top-k/beta lattice Viterbi CKY validation for CCG supertaggers (hol-ccg)"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pyyaml",
+    "tqdm",
+    "nltk",
+    "filelock",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+stsupport = "stsupport.cli:main"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/stsupport"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

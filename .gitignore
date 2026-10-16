@@ -1,0 +1,13 @@
+build/
+output/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyd
+*.so
+.pytest_cache/
+.cache/
+data/*.txt
+!data/tinystories_sample.txt
+data/raw/
+data/brown_news.jsonl

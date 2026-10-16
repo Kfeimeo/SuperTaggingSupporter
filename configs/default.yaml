@@ -1,0 +1,49 @@
+# SuperTaggingSupporter default configuration.
+# Every key maps onto src/stsupport/config.py; override on the CLI with
+#   stsupport run --set search.k=16 --set search.beta=0.99
+
+tagger:
+  model: ryosuke-yamaki/hol-ccg-roberta-large   # HF repo id or local bundle dir
+  device: cuda
+  batch_size: 32
+  grammar_mask: true        # drop supertags that are not licensed unary chains (hol-ccg candc mask)
+  hol_ccg_src: ../hol-ccg   # fallback checkout used when `import holccg` fails (relative to CWD)
+  autocast_bf16: false
+
+search:
+  k: 8                      # keep at most k categories per token ...
+  beta: 0.95                # ... or stop once their cumulative probability reaches beta
+  min_prob: 0.0
+  strategy: direct          # direct | progressive (k = 2, 4, ... up to k)
+  n_threads: 8             # C++ threads for batched parsing (0 = all cores)
+  max_tokens: 80
+
+grammar:
+  max_composition_degree: 2
+  harmonic_backward_composition: true
+  crossed_composition: true
+  bx_require_vp: true       # <Bx only into S\NP-shaped categories (C&C restriction)
+  comma_as_conj: true
+  type_raising: true
+  type_changing: true
+  max_unary_depth: 2
+  unary_penalty: 0.0        # 0 keeps the pure "product of supertag probabilities" objective
+  type_raise_penalty: 0.0
+  cell_beam: 0              # 0 = exact Viterbi
+  root_categories: ["S"]    # bare S = any S feature (S[dcl], S[wq], S[q], ...); add "S[b]\\NP" to accept imperatives
+  use_seen_rules: false     # restrict binary combinations to CCGbank-seen child pairs
+  seen_rules_path: model    # "model" = grammar_rule_counter.json of the bundle, or a path
+  # type_change_rules / type_raise_rules default to the C&C tables (see config.py)
+
+corpus:
+  path: data/tinystories_sample.txt
+  format: auto              # auto | txt (one sentence per line) | stories (raw dump) | jsonl
+  limit: null
+  min_tokens: 2
+  drop_quotes: true         # CCGbank has no quotation marks; drop `` '' before tagging
+
+output:
+  dir: output
+  name: run
+  write_auto: true
+  write_jsonl: true
