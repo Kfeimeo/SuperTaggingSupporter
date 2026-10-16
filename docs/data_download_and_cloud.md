@@ -136,6 +136,9 @@ python scripts/report_full_tinystories_experiment.py
 | 命令 | 参数 | 作用与默认值 |
 | --- | --- | --- |
 | `run_full_tinystories_experiment.py` | `--batch-size N` | GPU 超标注每批句数，默认 64 |
+| `run_full_tinystories_experiment.py` | `--pipeline-depth N` | GPU 阶段等待 CPU 汇总的批次数上限，默认 2 |
+| `run_full_tinystories_experiment.py` | `--async-workers N` | GPU 阶段概率汇总的 CPU 后台线程上限，默认 1；另有 1 个固定预取线程 |
+| `run_full_tinystories_experiment.py` | `--no-async` | 关闭 GPU 阶段的 CPU 预取和异步汇总，用于同步对照 |
 | `run_full_tinystories_experiment.py` | `--parse-threads N` | 自动衔接的 CPU 解析线程数，默认 4；0 为硬件线程数 |
 | `run_full_tinystories_experiment.py` | `--parse-batch-size N` | 自动衔接的 CPU 解析每批句数，默认 4 |
 | `stsupport run` / `build-lexicon` | `--set tagger.batch_size=N` | GPU 超标注每批句数，默认 32 |
@@ -185,6 +188,43 @@ python -u scripts/run_full_tinystories_experiment.py --data-dir /mnt/datasets --
 不传 CPU 参数时仍默认 4 线程、每批 4 句。无需另外启动 `eval-lexicon`；上面的独立命令用于单独重跑测评。
 CPU 设置也会记录在测评摘要和最终报告中。
 
+### GPU 阶段的 CPU/GPU 异步流水线
+
+默认启用，无需另外启动进程。流水线按以下方式工作：
+
+1. 一个 CPU 后台线程提前读取、分句、分词并排序下一组故事，最多预取一组。
+2. 主线程独占 GPU 模型，推理当前批次。
+3. `--async-workers` 个 CPU 汇总线程计算软计数和范畴支持次数，同时主线程继续下一批 GPU 推理。
+   多线程时按词分配到独立队列，同一个词的出现顺序和累加顺序保持一致，各线程不共享可变统计数组。
+4. 每组所有概率汇总完成后，主线程将统计与源文件偏移一起提交 SQLite。
+
+```bash
+python -u scripts/run_full_tinystories_experiment.py --data-dir /mnt/datasets --batch-size 128 --async-workers 4 --pipeline-depth 2 --parse-threads 16 --parse-batch-size 64
+```
+
+`--pipeline-depth 2` 表示最多有两批概率任务正在汇总或排队；加上当前 GPU 批次的结果，
+内存中可能同时存在三批原始概率缓冲，以及汇总线程的行切片、归一化等临时数组。
+队列满时会等待 CPU，避免缓存随语料增长。
+增大这个值主要增加主机内存使用，不会改变 GPU batch size。
+模型内部的子词输入准备、GPU 推理和结果回传仍由主线程执行；实际提速取决于 CPU/GPU 负载。
+`--async-workers 4` 配置最多 4 个概率汇总线程，另有 1 个固定的预取线程；
+默认 `--async-workers 1` 保留原来的单线程汇总行为。
+`--parse-threads 16` 独立控制后续 CPU 解析的 16 个线程。
+`--pipeline-depth` 按完整批次数限制在途任务，每批会分配给各汇总线程，不要求该值大于线程数。
+更多线程会增加临时内存与调度开销，实际提速也受 Python GIL、词频分布和 NumPy 运算影响，不保证线性增长。
+指定 `--no-async` 时不启动这些后台线程，`--async-workers` 不生效。
+
+同步对照命令：
+
+```bash
+python -u scripts/run_full_tinystories_experiment.py --data-dir /mnt/datasets --batch-size 128 --no-async
+```
+
+异步与同步使用相同的故事分组，并保持每个词的累加顺序，可沿用同配置的既有检查点；
+改变 `--async-workers` 不改变词典统计定义。
+读取预取或概率汇总失败会停止任务，未完成的故事组不会提交；恢复时重做该组。
+总进度百分比仍以已提交数据为准。主机上已经运行的进程需要更新代码后从检查点重新启动才会启用流水线。
+
 ## 6. 阶段标签与 tqdm 进度条
 
 全量命令自动打印以下阶段，并在 GPU、CPU 阶段显示各自的 tqdm 进度条：
@@ -219,5 +259,7 @@ python -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlit
 
 已测试续传、服务端忽略 Range、短响应重试、错误 Range、哈希失败、完整 partial 恢复、
 离线校验、自定义目录，以及新主机缺少历史基线时的报告生成。
+异步流水线已测试单组预取上限、CPU/GPU 调用端重叠、后台异常传播、
+同步/异步软计数逐元素一致，以及失败组不会推进 SQLite 检查点。
 本机使用 `python -S` 验证了下载/校验模式不依赖第三方包，并实际检查了已下载的官方训练文件。
 云主机的 CUDA 与驱动环境需要在目标机器运行 benchmark 确认。

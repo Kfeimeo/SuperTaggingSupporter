@@ -8,6 +8,11 @@ validation 保留，不混入 GPT-4 V2。官方文件固定到版本
 SHA-256 为 `c5cf5e22ff13614e830afbe61a99fbcbe8bcb7dd72252b989fa1117a368d401f`。
 
 全量标注在本机 GPU 执行，使用与此前相同的模型和 FP32 精度。
+GPU 阶段默认预取下一组故事，并异步汇总上一批概率，使 CPU 工作与 GPU 推理重叠。
+`--pipeline-depth` 控制汇总队列上限（默认 2）；`--no-async` 可切换为同步方式。
+`--async-workers N` 控制 GPU 阶段的概率汇总线程数（默认 1），另有 1 个固定预取线程；
+例如 `--async-workers 4` 使用最多 4 个汇总线程，同一个词始终按顺序累加。
+每组仍等待全部统计完成后再提交检查点。
 为减少逐词 GPU 调用，提供可选的向量化子词池化；启动前的实际模型验证记录在
 `output/tinystories_full.benchmark.json`。原来的默认超标注路径不变。
 

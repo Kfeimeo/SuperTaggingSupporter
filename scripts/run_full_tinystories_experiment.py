@@ -20,6 +20,7 @@ import numpy as np
 from tqdm import tqdm
 
 from download_tinystories import SHA256, download
+from stsupport.async_pipeline import LexiconAccumulator, prefetch_one
 from stsupport.corpus import sentence_splitter_name, split_sentences, tokenize
 from stsupport.disk_lexicon import LexiconStore
 from stsupport.lexicon import GlobalLexicon
@@ -74,6 +75,24 @@ def write_status(path, payload):
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def prepared_groups(path, offset, group_size):
+    stream = stories(path, offset)
+    try:
+        while group := list(islice(stream, group_size)):
+            sentences, filtered = [], 0
+            for text, _ in group:
+                for sentence in split_sentences(text):
+                    tokens = tokenize(sentence)
+                    if len(tokens) >= 2:
+                        sentences.append(tokens)
+                    else:
+                        filtered += 1
+            sentences.sort(key=len)
+            yield {"sentences": sentences, "stories": len(group), "offset": group[-1][1], "filtered": filtered}
+    finally:
+        stream.close()
 
 
 def tag_safe(tagger, sentences, stats):
@@ -142,12 +161,15 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--parse-threads", type=int, default=4, help="CPU parser threads (default: 4; 0: hardware thread count)")
     parser.add_argument("--parse-batch-size", type=int, default=4, help="target sentences per CPU parser batch (default: 4)")
+    parser.add_argument("--pipeline-depth", type=int, default=2, help="maximum CPU aggregation batches in flight (default: 2)")
+    parser.add_argument("--async-workers", type=int, default=1, help="CPU aggregation threads during GPU stage (default: 1; plus one prefetch thread)")
+    parser.add_argument("--no-async", action="store_true", help="disable CPU prefetch/aggregation overlap for comparison")
     parser.add_argument("--stories-per-checkpoint", type=int, default=128)
     parser.add_argument("--data-dir", type=Path, default=None, help="contains raw/TinyStories-train.txt and brown_news.jsonl")
     parser.add_argument("--no-progress", action="store_true", help="disable tqdm bars; retain stage messages and checkpoint logs")
     args = parser.parse_args(argv)
-    if args.batch_size < 1 or args.stories_per_checkpoint < 1 or args.parse_batch_size < 1:
-        parser.error("batch and checkpoint sizes must be positive")
+    if args.batch_size < 1 or args.stories_per_checkpoint < 1 or args.parse_batch_size < 1 or args.pipeline_depth < 1 or args.async_workers < 1:
+        parser.error("batch sizes, checkpoint size, pipeline-depth and async-workers must be positive")
     if args.parse_threads < 0:
         parser.error("parse-threads must be >= 0")
     return args
@@ -166,6 +188,7 @@ def main():
     lock.acquire(timeout=0)
     state_path = output / "tinystories_full.status.json"
     gpu_bar = None
+    groups = None
     try:
         print("[1/4 PREPARE] Verify source data and load GPU model", flush=True)
         if not args.benchmark_only:
@@ -199,45 +222,40 @@ def main():
         progress.setdefault("offset", 0)
         progress.setdefault("elapsed_seconds", 0)
         progress.setdefault("filtered_short_sentences", 0)
-        stream = stories(path, progress["offset"])
+        groups = prefetch_one(prepared_groups(path, progress["offset"], args.stories_per_checkpoint), enabled=not args.no_async)
         elapsed_base = progress["elapsed_seconds"]
         run_start = time.perf_counter()
-        print("[2/4 GPU] Supertag source stories and build global lexicon", flush=True)
+        print(f"[2/4 GPU] Supertag + lexicon (CPU overlap={not args.no_async}, async_workers={args.async_workers if not args.no_async else 0}, pipeline_depth={args.pipeline_depth})", flush=True)
         gpu_bar = tqdm(total=path.stat().st_size, initial=progress["offset"],
                        desc="[2/4 GPU] Source processed", unit="B", unit_scale=True,
                        dynamic_ncols=True, mininterval=1, disable=args.no_progress)
         last_gpu_refresh = time.monotonic()
-        while group := list(islice(stream, args.stories_per_checkpoint)):
-            sentences = []
-            for text, _ in group:
-                for sentence in split_sentences(text):
-                    tokens = tokenize(sentence)
-                    if len(tokens) >= 2:
-                        sentences.append(tokens)
-                    else:
-                        progress["filtered_short_sentences"] += 1
-            sentences.sort(key=len)
+        for group in groups:
+            sentences = group["sentences"]
             delta = GlobalLexicon(tagger.categories)
-            for start in range(0, len(sentences), args.batch_size):
-                batch = sentences[start:start + args.batch_size]
-                distributions = tag_safe(tagger, batch, progress)
-                if len(distributions) != len(batch):
-                    raise ValueError("tagger sentence count mismatch")
-                for tokens, probs in zip(batch, distributions):
-                    delta.add(tokens, probs, k=8, beta=0.99, exclude=tagger.excluded_ids)
-                gpu_bar.set_postfix(stories=progress["stories"], sentences=progress["sentences"],
-                                    batch=f"{min(start + len(batch), len(sentences))}/{len(sentences)}", refresh=False)
-                if time.monotonic() - last_gpu_refresh >= 1:
-                    gpu_bar.refresh()
-                    last_gpu_refresh = time.monotonic()
-            progress["stories"] += len(group)
+            with LexiconAccumulator(delta, exclude=tagger.excluded_ids, enabled=not args.no_async,
+                                    max_pending=args.pipeline_depth, workers=args.async_workers) as accumulator:
+                for start in range(0, len(sentences), args.batch_size):
+                    batch = sentences[start:start + args.batch_size]
+                    distributions = tag_safe(tagger, batch, progress)
+                    accumulator.add_batch(batch, distributions)
+                    gpu_bar.set_postfix(stories=progress["stories"], sentences=progress["sentences"],
+                                        batch=f"{min(start + len(batch), len(sentences))}/{len(sentences)}", refresh=False)
+                    if time.monotonic() - last_gpu_refresh >= 1:
+                        gpu_bar.refresh()
+                        last_gpu_refresh = time.monotonic()
+            # Context exit joins CPU aggregation; only then advance the durable offset.
+            progress["stories"] += group["stories"]
             progress["sentences"] += len(sentences)
-            progress["offset"] = group[-1][1]
+            progress["filtered_short_sentences"] += group["filtered"]
+            progress["offset"] = group["offset"]
             progress["elapsed_seconds"] = elapsed_base + time.perf_counter() - run_start
             store.commit(delta, progress)
             current = {**progress, **store.summary(), "stage": "building_lexicon", "pid": os.getpid(),
                        "source_bytes": path.stat().st_size,
                        "source_byte_fraction": progress["offset"] / path.stat().st_size}
+            current.update(cpu_gpu_overlap=not args.no_async, pipeline_depth=args.pipeline_depth,
+                           async_workers=args.async_workers if not args.no_async else 0)
             if progress["offset"]:
                 current["estimated_remaining_hours"] = progress["elapsed_seconds"] / progress["offset"] * (path.stat().st_size - progress["offset"]) / 3600
             write_status(state_path, current)
@@ -276,6 +294,8 @@ def main():
                                       "resume": "python -u scripts/run_full_tinystories_experiment.py"})
         raise
     finally:
+        if groups is not None:
+            groups.close()
         if gpu_bar is not None:
             gpu_bar.close()
         lock.release()

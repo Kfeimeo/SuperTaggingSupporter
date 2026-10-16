@@ -90,6 +90,10 @@ def test_full_workflow_forwards_cpu_options_independently(monkeypatch):
     assert "--no-progress" in command
     assert runner.parse_args([]).parse_threads == 4
     assert runner.parse_args(["--parse-threads", "0"]).parse_threads == 0
-    for invalid in (["--parse-threads", "-1"], ["--parse-batch-size", "0"]):
+    assert runner.parse_args([]).pipeline_depth == 2
+    assert runner.parse_args([]).async_workers == 1
+    assert runner.parse_args(["--async-workers", "4"]).async_workers == 4
+    assert runner.parse_args(["--no-async"]).no_async
+    for invalid in (["--parse-threads", "-1"], ["--parse-batch-size", "0"], ["--pipeline-depth", "0"], ["--async-workers", "0"]):
         with pytest.raises(SystemExit):
             runner.parse_args(invalid)
