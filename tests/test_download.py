@@ -110,7 +110,8 @@ def test_cli_split_all_and_custom_directory(tmp_path, downloader, monkeypatch):
     assert all(c["output_dir"] == tmp_path and c["verify_only"] for c in calls)
 
 
-def test_cloud_report_accepts_missing_local_baselines(tmp_path):
+@pytest.mark.parametrize("backend", ["threads", "processes"])
+def test_cloud_report_accepts_missing_local_baselines(tmp_path, backend):
     scripts = Path(__file__).resolve().parents[1] / "scripts"
     spec = importlib.util.spec_from_file_location("full_report", scripts / "report_full_tinystories_experiment.py")
     module = importlib.util.module_from_spec(spec)
@@ -126,9 +127,13 @@ def test_cloud_report_accepts_missing_local_baselines(tmp_path):
               "category_pairs": 2, "elapsed_seconds": 10, "metadata": {"source": {"sha256": "hash"}}}
     full = {"sentences": 1, "covered_sentences": 1, "parsed": 1, "seconds": 1,
             "target_corpus": {"path": str(corpus)}, "avg_candidates_per_available_token": 1,
+            "parser_backend": backend, "processes": 4, "max_in_flight": 8,
             **{k: 1 for k in ("token_candidate_coverage", "word_type_coverage", "sentence_candidate_coverage", "parse_rate_all", "parse_rate_covered_eligible")}}
     (out / "tinystories_full.lexicon.summary.json").write_text(json.dumps(source))
     (out / "brown_news_full_global_lexicon.summary.json").write_text(json.dumps(full))
     module.main(tmp_path)
     report = (tmp_path / "docs/tinystories_full_experiment.md").read_text(encoding="utf-8")
     assert "未运行" in report and "100.00%" in report
+    if backend == "processes":
+        assert "4 个独立解析进程" in report
+        assert "--parser-backend processes --processes 4 --max-in-flight 8" in report

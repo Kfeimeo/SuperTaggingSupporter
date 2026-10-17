@@ -46,6 +46,15 @@ def main(root=None):
                           "其候选集合与全局词典组不同。")
     else:
         reference_text = "此主机尚未运行上下文超标注参考组。未提供的基线列标为“未运行”，不会冒充实测结果。"
+    if full.get("parser_backend") == "processes":
+        parser_text = (f"使用 {full['processes']} 个独立解析进程，每进程单线程，"
+                       f"最多 {full['max_in_flight']} 个有效句子在途；动态调度，无解析批次屏障。")
+        parser_args = (f"--parser-backend processes --processes {full['processes']} "
+                       f"--max-in-flight {full['max_in_flight']}")
+    else:
+        parser_text = (f"解析线程参数为 {full.get('n_threads', 4)}（0 表示自动使用硬件线程数），"
+                       f"每批 {full.get('batch_size', 4)} 句。")
+        parser_args = f"--parser-backend threads --set search.n_threads={full.get('n_threads', 4)}"
     text = f"""# 完整 TinyStories 训练集 → Brown news
 
 ## 数据与设置
@@ -58,8 +67,7 @@ def main(root=None):
 
 与小样本实验相同：`k=8, beta=0.99` 候选并集、完整概率分布的算术平均、
 `min_support=1`、保留大小写、严格 OOV；目标固定为 Brown news 的 {full['sentences']:,} 句，
-语法不变、无 beam、句长上限 {full.get('max_tokens', 80)}，解析线程参数为 {full.get('n_threads', 4)}
-（0 表示自动使用硬件线程数），每批 {full.get('batch_size', 4)} 句。
+语法不变、无 beam、句长上限 {full.get('max_tokens', 80)}。{parser_text}
 FP32 神经推理使用向量化词级池化；小批验证与原实现最大概率差值记录在 benchmark 文件中。
 超过模型容量的个别源句会拆成子上下文，保留全部 token，
 累计拆分操作为 {source.get('long_sentence_chunk_operations', 0):,} 次。
@@ -101,7 +109,7 @@ python -u scripts/run_full_tinystories_experiment.py
 单独重跑测评：
 
 ```powershell
-python -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlite --corpus data/brown_news.jsonl --format jsonl --set output.name=brown_news_full_global_lexicon --set search.n_threads={full.get('n_threads', 4)} --batch-size {full.get('batch_size', 4)}
+python -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlite --corpus data/brown_news.jsonl --format jsonl --set output.name=brown_news_full_global_lexicon {parser_args} --batch-size {full.get('batch_size', 4)}
 python scripts/report_full_tinystories_experiment.py
 ```
 

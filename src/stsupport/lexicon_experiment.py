@@ -10,9 +10,12 @@ import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter
+from contextlib import closing
 from dataclasses import asdict
 from itertools import islice
 from pathlib import Path
+import sqlite3
+from tempfile import TemporaryDirectory
 from tqdm import tqdm
 
 from stsupport.config import dump_config, load_config
@@ -23,7 +26,7 @@ from stsupport.lexicon import GlobalLexicon
 logger = logging.getLogger(__name__)
 
 
-def process_resources():
+def process_resources(pids=()):
     """Dependency-free Linux RSS/swap diagnostics; CPU time also works elsewhere."""
     result = {"cpu_seconds": time.process_time()}
     try:
@@ -34,6 +37,18 @@ def process_resources():
                     result["rss_gib" if key == "VmRSS" else "swap_gib"] = int(value.split()[0]) / (1024 ** 2)
     except (OSError, ValueError):
         pass
+    for pid in pids:
+        try:
+            # /proc/PID/stat fields 14/15, after the parenthesized comm field.
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            result["cpu_seconds"] += (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                key, _, value = line.partition(":")
+                if key in {"VmRSS", "VmSwap"}:
+                    name = "rss_gib" if key == "VmRSS" else "swap_gib"
+                    result[name] = result.get(name, 0) + int(value.split()[0]) / (1024 ** 2)
+        except (OSError, ValueError, IndexError, AttributeError):
+            pass
     return result
 
 
@@ -114,25 +129,127 @@ def cmd_build_lexicon(args):
     return 0
 
 
+def _prepare_record(lex, tokens, max_tokens, min_support, weighting):
+    lattice = lex.lattice(tokens, min_support=min_support, weighting=weighting)
+    oov = [i for i, w in enumerate(tokens) if lex.key(w) not in lex.counts]
+    empty = [i for i, cell in enumerate(lattice) if not cell and i not in oov]
+    record = {"tokens": tokens, "status": "fail", "reason": None,
+              "oov_positions": oov, "filtered_positions": empty,
+              "lattice_sizes": [len(c) for c in lattice], "root_cat": None,
+              "final_tags": None, "logprob": None, "auto": None, "root_cell_cats": []}
+    if len(tokens) > max_tokens:
+        record.update(status="skipped", reason="max_tokens")
+    elif oov:
+        record["reason"] = "oov"
+    elif empty:
+        record["reason"] = "empty_support"
+    return record, lattice
+
+
+def _fill_record(record, out):
+    if out["ok"]:
+        record.update(status="parsed", root_cat=out["root_cat"], final_tags=leaf_categories(out),
+                      logprob=float(out["score"]), auto=render_auto(out))
+    else:
+        record.update(reason="no_derivation", root_cell_cats=list(out["root_cell_cats"]))
+
+
+def evaluate_processes(grammar, lex, sentences, *, processes=4, max_in_flight=8, prepare_batch_size=64,
+                       max_tokens=80, min_support=1, weighting="mean", heartbeat_seconds=10,
+                       on_complete=None, on_wait=None, spool_dir=None):
+    """Map sentences to private engines; reduce in input order via a disk spool.
+
+    The spool bounds Python result memory without holding up scheduling behind
+    a slow early sentence. It is temporary storage, NOT a resume checkpoint.
+    """
+    from stsupport.engine import load_seen_rules
+    from stsupport.process_parser import IndependentParsers
+
+    if processes < 1 or max_in_flight < processes or prepare_batch_size < 1:
+        raise ValueError("require processes >= 1, max_in_flight >= processes, prepare_batch_size >= 1")
+    if not math.isfinite(heartbeat_seconds) or heartbeat_seconds <= 0:
+        raise ValueError("heartbeat_seconds must be finite and positive")
+    seen_rules = load_seen_rules(grammar.seen_rules_path) if grammar.use_seen_rules else None
+    source = iter(sentences)
+    pool = None
+    exhausted = False
+    submitted = completed = next_output = eligible = total_sizes = token_count = max_size = 0
+    started = time.perf_counter()
+    with TemporaryDirectory(prefix="ccg-results-", dir=spool_dir) as temporary:
+        with closing(sqlite3.connect(Path(temporary) / "ordered.sqlite", isolation_level=None)) as spool:
+            spool.execute("PRAGMA journal_mode=OFF")
+            spool.execute("PRAGMA synchronous=OFF")
+            spool.execute("CREATE TABLE ready (id INTEGER PRIMARY KEY, record TEXT NOT NULL)")
+
+            def finished(index, record):
+                nonlocal completed
+                completed += 1
+                if on_complete is not None:
+                    on_complete(index, record)
+                spool.execute("INSERT INTO ready VALUES (?, ?)", (index, json.dumps(record, ensure_ascii=False)))
+
+            try:
+                while not exhausted or (pool is not None and pool.pending):
+                    # The preparation batch only limits coordinator work per
+                    # turn; it never imposes a barrier on running sentences.
+                    for _ in range(prepare_batch_size):
+                        if exhausted or (pool is not None and len(pool.pending) >= max_in_flight):
+                            break
+                        try:
+                            tokens = next(source)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        index = submitted
+                        submitted += 1
+                        record, lattice = _prepare_record(lex, tokens, max_tokens, min_support, weighting)
+                        sizes = record["lattice_sizes"]
+                        total_sizes += sum(sizes)
+                        token_count += len(sizes)
+                        max_size = max(max_size, max(sizes, default=0))
+                        if record["reason"] is not None:
+                            finished(index, record)
+                        else:
+                            eligible += 1
+                            if pool is None:
+                                pool = IndependentParsers(grammar, seen_rules, processes)
+                            pool.submit(index, tokens, lattice, record)
+                    if pool is not None:
+                        should_wait = pool.pending and (exhausted or len(pool.pending) >= max_in_flight)
+                        timeout = min(heartbeat_seconds, 0.2) if should_wait else 0
+                        for index, record, out in pool.poll(timeout):
+                            _fill_record(record, out)
+                            finished(index, record)
+                    if on_wait is not None:
+                        running = list(pool.busy.values()) if pool is not None else []
+                        pending = pool.pending if pool is not None else {}
+                        examples = sorted(running, key=lambda i: sum(pending[i]["lattice_sizes"]), reverse=True)[:3]
+                        on_wait({"backend": "processes", "elapsed_seconds": time.perf_counter() - started,
+                                 "running": len(running), "queued": len(pool.queued) if pool is not None else 0,
+                                 "eligible": eligible, "submitted": submitted, "completed": completed,
+                                 "buffered_results": completed - next_output,
+                                 "avg_candidates": total_sizes / max(1, token_count), "max_candidates": max_size,
+                                 "pids": pool.pids if pool is not None else [],
+                                 "examples": [{"index": i, "tokens": len(pending[i]["tokens"]),
+                                               "candidates": sum(pending[i]["lattice_sizes"])} for i in examples]})
+                    while row := spool.execute("SELECT record FROM ready WHERE id=?", (next_output,)).fetchone():
+                        spool.execute("DELETE FROM ready WHERE id=?", (next_output,))
+                        next_output += 1
+                        yield json.loads(row[0])
+            finally:
+                if pool is not None:
+                    pool.close(abort=not exhausted or bool(pool.pending))
+                if hasattr(source, "close"):
+                    source.close()
+
+
 def evaluate_batch(engine, lex, sentences, *, max_tokens=80, n_threads=0, min_support=1, weighting="mean",
                    on_complete=None, on_wait=None, heartbeat_seconds=10):
     """Parse full dictionary lattices; never prune or consult a supertagger."""
     records, active, lattices = [], [], []
     for tokens in sentences:
-        lattice = lex.lattice(tokens, min_support=min_support, weighting=weighting)
-        oov = [i for i, w in enumerate(tokens) if lex.key(w) not in lex.counts]
-        empty = [i for i, cell in enumerate(lattice) if not cell and i not in oov]
-        record = {"tokens": tokens, "status": "fail", "reason": None,
-                  "oov_positions": oov, "filtered_positions": empty,
-                  "lattice_sizes": [len(c) for c in lattice], "root_cat": None,
-                  "final_tags": None, "logprob": None, "auto": None, "root_cell_cats": []}
-        if len(tokens) > max_tokens:
-            record.update(status="skipped", reason="max_tokens")
-        elif oov:
-            record["reason"] = "oov"
-        elif empty:
-            record["reason"] = "empty_support"
-        else:
+        record, lattice = _prepare_record(lex, tokens, max_tokens, min_support, weighting)
+        if record["reason"] is None:
             active.append(len(records))
             lattices.append(lattice)
         records.append(record)
@@ -140,11 +257,7 @@ def evaluate_batch(engine, lex, sentences, *, max_tokens=80, n_threads=0, min_su
             on_complete(len(records) - 1, record)
 
     def fill(index, out):
-        if out["ok"]:
-            records[index].update(status="parsed", root_cat=out["root_cat"], final_tags=leaf_categories(out),
-                                  logprob=float(out["score"]), auto=render_auto(out))
-        else:
-            records[index].update(reason="no_derivation", root_cell_cats=list(out["root_cell_cats"]))
+        _fill_record(records[index], out)
         if on_complete is not None:
             on_complete(index, records[index])
 
@@ -211,11 +324,17 @@ def cmd_eval_lexicon(args):
         raise ValueError("max_tokens, min_support and batch_size must be positive")
     if not math.isfinite(args.heartbeat_seconds) or args.heartbeat_seconds <= 0:
         raise ValueError("heartbeat_seconds must be finite and positive")
+    max_in_flight = args.max_in_flight if args.max_in_flight is not None else args.processes * 2
+    if args.processes < 1 or max_in_flight < args.processes:
+        raise ValueError("require processes >= 1 and max-in-flight >= processes")
     lex = GlobalLexicon.load(args.lexicon)
     source = lex.metadata.get("source", {})
     if "drop_quotes" in source and source["drop_quotes"] != cfg.corpus.drop_quotes:
         raise ValueError("corpus.drop_quotes must match the source lexicon preprocessing")
-    engine = _build_engine(cfg, None)
+    engine = _build_engine(cfg, None) if args.parser_backend == "threads" else None
+    logger.info("[CPU] backend=%s processes=%s threads=%s max_in_flight=%s", args.parser_backend,
+                args.processes if engine is None else 0, cfg.search.n_threads if engine is not None else 1,
+                max_in_flight if engine is None else args.batch_size)
     out_dir = Path(cfg.output.dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = out_dir / cfg.output.name
@@ -233,41 +352,58 @@ def cmd_eval_lexicon(args):
               mininterval=1, disable=args.no_progress) as bar, \
             Path(f"{prefix}.jsonl").open("w", encoding="utf-8") as jsonl, \
             Path(f"{prefix}.auto").open("w", encoding="utf-8") as auto:
-        for chunk in _batches(_stream(cfg), args.batch_size):
-            batch_start = counts["sentences"]
-            last_heartbeat = float("-inf")
-            last_cpu_sample = (time.monotonic(), time.process_time())
+        last_heartbeat = float("-inf")
+        last_cpu_sample = (time.monotonic(), time.process_time())
+        batch_start = batch_length = 0
 
-            def completed(index, record):
-                live_counts[record["status"]] += 1
-                bar.set_postfix(parsed=live_counts["parsed"], failed=live_counts["fail"],
-                                skipped=live_counts["skipped"], refresh=False)
-                bar.update(1)
+        def completed(index, record):
+            live_counts[record["status"]] += 1
+            bar.set_postfix(parsed=live_counts["parsed"], failed=live_counts["fail"],
+                            skipped=live_counts["skipped"], refresh=False)
+            bar.update(1)
 
-            def heartbeat(info):
-                nonlocal last_heartbeat, last_cpu_sample
-                bar.set_postfix(parsed=live_counts["parsed"], failed=live_counts["fail"], skipped=live_counts["skipped"],
-                                running=info["running"], queued=info["queued"], max_cands=info["max_candidates"], refresh=False)
-                now = time.monotonic()
-                if now - last_heartbeat >= args.heartbeat_seconds:
-                    resources = process_resources()
-                    interval = now - last_cpu_sample[0]
-                    cores = (resources["cpu_seconds"] - last_cpu_sample[1]) / interval if interval >= 0.1 else None
-                    resource_text = f" cpu_cores={cores:.2f}" if cores is not None else ""
-                    resource_text += "".join(f" {name}={resources[name]:.2f}" for name in ("rss_gib", "swap_gib") if name in resources)
-                    examples = "; ".join(f"sentence.{batch_start + item['index'] + 1} len={item['tokens']} candidates={item['candidates']}"
-                                         for item in info["examples"])
-                    tqdm.write(f"[CPU] Batch {batch_start + 1}-{batch_start + len(chunk)}: "
-                               f"elapsed={info['elapsed_seconds']:.1f}s running={info['running']} queued={info['queued']} "
-                               f"eligible={info['eligible']} avg_cands/token={info['avg_candidates']:.1f} "
-                               f"max_cands/token={info['max_candidates']}{resource_text}; {examples}", file=sys.stderr)
-                    bar.refresh()
-                    last_heartbeat = now
-                    last_cpu_sample = (now, resources["cpu_seconds"])
+        def heartbeat(info):
+            nonlocal last_heartbeat, last_cpu_sample
+            bar.set_postfix(parsed=live_counts["parsed"], failed=live_counts["fail"], skipped=live_counts["skipped"],
+                            running=info["running"], queued=info["queued"], max_cands=info["max_candidates"], refresh=False)
+            now = time.monotonic()
+            if now - last_heartbeat >= args.heartbeat_seconds:
+                resources = process_resources(info.get("pids", ()))
+                interval = now - last_cpu_sample[0]
+                sampled = not info.get("pids") or sys.platform.startswith("linux")
+                cores = (resources["cpu_seconds"] - last_cpu_sample[1]) / interval if interval >= 0.1 and sampled else None
+                resource_text = f" cpu_cores={cores:.2f}" if cores is not None else ""
+                resource_text += "".join(f" {name}={resources[name]:.2f}" for name in ("rss_gib", "swap_gib") if name in resources)
+                is_process = info.get("backend") == "processes"
+                offset = 0 if is_process else batch_start
+                examples = "; ".join(f"sentence.{offset + item['index'] + 1} len={item['tokens']} candidates={item['candidates']}"
+                                     for item in info["examples"])
+                label = (f"Processes submitted={info['submitted']} completed={info['completed']} "
+                         f"buffered_results={info['buffered_results']}" if is_process
+                         else f"Batch {batch_start + 1}-{batch_start + batch_length}")
+                tqdm.write(f"[CPU] {label}: elapsed={info['elapsed_seconds']:.1f}s "
+                           f"running={info['running']} queued={info['queued']} eligible={info['eligible']} "
+                           f"avg_cands/token={info['avg_candidates']:.1f} max_cands/token={info['max_candidates']}"
+                           f"{resource_text}; {examples}", file=sys.stderr)
+                bar.refresh()
+                last_heartbeat = now
+                last_cpu_sample = (now, resources["cpu_seconds"])
 
-            records = evaluate_batch(engine, lex, chunk, max_tokens=cfg.search.max_tokens,
-                                     n_threads=cfg.search.n_threads, min_support=args.min_support, weighting=args.weighting,
-                                     on_complete=completed, on_wait=heartbeat, heartbeat_seconds=args.heartbeat_seconds)
+        def threaded_records():
+            nonlocal batch_start, batch_length
+            for chunk in _batches(_stream(cfg), args.batch_size):
+                batch_start, batch_length = counts["sentences"], len(chunk)
+                yield from evaluate_batch(engine, lex, chunk, max_tokens=cfg.search.max_tokens,
+                                          n_threads=cfg.search.n_threads, min_support=args.min_support, weighting=args.weighting,
+                                          on_complete=completed, on_wait=heartbeat, heartbeat_seconds=args.heartbeat_seconds)
+
+        records = (evaluate_processes(cfg.grammar, lex, _stream(cfg), processes=args.processes,
+                                     max_in_flight=max_in_flight, prepare_batch_size=args.batch_size,
+                                     max_tokens=cfg.search.max_tokens, min_support=args.min_support, weighting=args.weighting,
+                                     on_complete=completed, on_wait=heartbeat, heartbeat_seconds=args.heartbeat_seconds,
+                                     spool_dir=out_dir)
+                   if args.parser_backend == "processes" else threaded_records())
+        with closing(records):
             for record in records:
                 tokens = record["tokens"]
                 counts["sentences"] += 1
@@ -289,10 +425,9 @@ def cmd_eval_lexicon(args):
                 if cfg.output.write_auto:
                     auto.write(f"ID={record['id']} PARSER=GLOBALLEXICON STATUS={record['status']} "
                                f"NUMPARSE={int(record['status'] == 'parsed')}\n{record['auto'] or ''}\n")
-            bar.set_postfix(parsed=counts["parsed"], failed=counts["fail"], skipped=counts["skipped"], refresh=False)
-            if args.no_progress:
-                logger.info("[CPU] evaluated %d/%d sentences: %d parsed, %d failed, %d skipped", counts["sentences"],
-                            target_total, counts["parsed"], counts["fail"], counts["skipped"])
+                if args.no_progress and (counts["sentences"] % args.batch_size == 0 or counts["sentences"] == target_total):
+                    logger.info("[CPU] evaluated %d/%d sentences: %d parsed, %d failed, %d skipped", counts["sentences"],
+                                target_total, counts["parsed"], counts["fail"], counts["skipped"])
     def ratio(n, d):
         return n / d if d else None
 
@@ -318,6 +453,10 @@ def cmd_eval_lexicon(args):
         "all_dictionary_candidates_used": True, "exact_chart": cfg.grammar.cell_beam == 0,
         "max_tokens": cfg.search.max_tokens,
         "n_threads": cfg.search.n_threads, "batch_size": args.batch_size,
+        "parser_backend": args.parser_backend,
+        "processes": args.processes if args.parser_backend == "processes" else 0,
+        "max_in_flight": max_in_flight if args.parser_backend == "processes" else args.batch_size,
+        "threads_per_process": 1 if args.parser_backend == "processes" else None,
     }
     Path(f"{prefix}.summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     Path(f"{prefix}.oov.json").write_text(json.dumps(dict(oov_counts.most_common()), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -349,4 +488,8 @@ def register_commands(sub):
             command.add_argument("--heartbeat-seconds", type=float, default=10, help="CPU running/queued status interval (default: 10s)")
             command.add_argument("--min-support", type=int, default=1, help="minimum selected occurrences of each word-category pair")
             command.add_argument("--weighting", choices=["mean", "uniform"], default="mean")
-            command.add_argument("--batch-size", type=int, default=16, help="sentences per parser batch")
+            command.add_argument("--batch-size", type=int, default=16, help="thread batch size; process mode: preparation chunk size (no parse barrier)")
+            command.add_argument("--parser-backend", choices=["threads", "processes"], default="threads",
+                                 help="shared-engine threads (default) or independent-engine processes")
+            command.add_argument("--processes", type=int, default=4, help="independent parser processes (default: 4; one native thread each)")
+            command.add_argument("--max-in-flight", type=int, default=None, help="maximum queued + running eligible sentences (default: 2 * processes)")

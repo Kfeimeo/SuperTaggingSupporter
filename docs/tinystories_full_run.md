@@ -48,6 +48,12 @@ python -u scripts/run_full_tinystories_experiment.py --batch-size 64 --stories-p
 同一条命令可以通过 `--parse-threads 16 --parse-batch-size 64` 配置后续自动执行的 CPU 阶段；
 `--batch-size` 仅控制 GPU 超标注，CPU 参数默认均为 4。
 
+CPU 可改用独立引擎多进程，避免共享缓存锁竞争：在同一条全量命令上加
+`--parse-backend processes --parse-processes 4 --parse-max-in-flight 8`。
+这时 `--parse-threads` 不生效，`--parse-batch-size` 仅控制主进程每轮准备句数，没有整批解析等待。
+也可在词典构建后直接运行 `eval-lexicon --parser-backend processes --processes 4 --max-in-flight 8`，
+详细命令、内存代价和自定义语料示例见 [云主机运行文档](data_download_and_cloud.md#独立进程解析动态派发与主进程汇总)。
+
 脚本自带互斥锁，拒绝两个实例同时修改同一词典。数据哈希、模型路径、候选阈值和
 分句后端等设置必须与检查点相同；更换设置时应使用独立实验文件。
 如果构建已完成而后续测评失败，完整源词典仍保留，可单独重跑：

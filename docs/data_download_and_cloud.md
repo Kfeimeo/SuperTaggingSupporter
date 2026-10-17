@@ -141,9 +141,15 @@ python scripts/report_full_tinystories_experiment.py
 | `run_full_tinystories_experiment.py` | `--no-async` | 关闭 GPU 阶段的 CPU 预取和异步汇总，用于同步对照 |
 | `run_full_tinystories_experiment.py` | `--parse-threads N` | 自动衔接的 CPU 解析线程数，默认 4；0 为硬件线程数 |
 | `run_full_tinystories_experiment.py` | `--parse-batch-size N` | 自动衔接的 CPU 解析每批句数，默认 4 |
+| `run_full_tinystories_experiment.py` | `--parse-backend threads\|processes` | CPU 后端，默认 threads；processes 为独立引擎多进程 |
+| `run_full_tinystories_experiment.py` | `--parse-processes N` | 多进程模式的工作进程数，默认 4 |
+| `run_full_tinystories_experiment.py` | `--parse-max-in-flight N` | 多进程模式中排队和解析中的有效句数上限，默认进程数的 2 倍 |
 | `stsupport run` / `build-lexicon` | `--set tagger.batch_size=N` | GPU 超标注每批句数，默认 32 |
 | `stsupport eval-lexicon` | `--set search.n_threads=N` | C++ 句子间并行解析线程数；不加载配置文件时默认 0，自动使用硬件线程数 |
-| `stsupport eval-lexicon` | `--batch-size N` | 每批提交的目标句数，默认 16；限制该批可用并行度 |
+| `stsupport eval-lexicon` | `--batch-size N` | 默认 16；线程模式为解析批大小，多进程模式为主进程每轮准备句数，无整批等待 |
+| `stsupport eval-lexicon` | `--parser-backend threads\|processes` | 默认 threads；processes 使用持久的独立解析进程 |
+| `stsupport eval-lexicon` | `--processes N` | 工作进程数，默认 4；每进程串行解析，一次处理一句 |
+| `stsupport eval-lexicon` | `--max-in-flight N` | 已提交且尚未完成的有效句数上限，默认 `2 * processes`，不得小于进程数 |
 
 配置文件或已有 `--set` 设置可以覆盖上述配置项的默认值。
 
@@ -241,7 +247,8 @@ python -u scripts/run_full_tinystories_experiment.py --data-dir /mnt/datasets --
 GPU 总进度按源文件已完成并提交检查点的字节量计，不代表故事数或句数百分比；
 右侧还显示当前组的超标注句子进度。恢复运行时总进度从已保存偏移继续，ETA 按恢复后的处理速度估计。
 CPU 总进度按目标语料的有效句数计，包括解析失败、OOV 和超长跳过的句子，每完成一句就更新。
-已完成的句子不必等待同批慢句才显示进度；结果文件仍按原语料顺序、按批写入。
+已完成的句子不必等待同批慢句才显示进度；线程模式结果按原语料顺序、按批写入。
+多进程模式采用下节的动态调度与磁盘暂存，按顺序可写的结果持续输出。
 CPU 开始前会先扫描目标语料以确定总句数，不会一次将整个语料载入内存。
 即使没有句子完成，也会定时输出 `[CPU] Batch ...` 状态，默认每 10 秒一次，可用
 `eval-lexicon --heartbeat-seconds 5` 调整。状态包括正在处理/排队的句数、候选规模，
@@ -292,7 +299,7 @@ swap 活跃可能表示换页，线程长时间等待 futex 可能涉及锁等�
 
 ### Ctrl+C 中止 CPU 测评
 
-CPU 测评支持协作取消：按 Ctrl+C 后，主线程先通知正在运行的 C++ 解析循环退出，
+线程模式的 CPU 测评支持协作取消：按 Ctrl+C 后，主线程先通知正在运行的 C++ 解析循环退出，
 取消尚未开始的句子，再等待工作线程清理图表。图表较大或线程正在执行单次规则运算时，
 清理仍可能需要一些时间。词典只读，不受中止影响；CPU 测评仍没有句子级恢复，
 同一命令重跑会重新测评并覆盖同名输出，未完成批次也不会写入结果文件。
@@ -317,6 +324,75 @@ kill -TERM PID
 
 这里的 `PID` 替换为确认过的测评进程 ID。若仍未退出，再使用 `kill -KILL PID`。
 
+### 独立进程解析：动态派发与主进程汇总
+
+全局词典候选很多时，可切换到独立进程模式，避免多个句子争用同一个 C++ 引擎中的规则缓存锁：
+
+```bash
+python -u -m stsupport eval-lexicon \
+  --lexicon output/tinystories_full.lexicon.sqlite \
+  --corpus ./data/brown_news.jsonl \
+  --parser-backend processes \
+  --processes 4 \
+  --max-in-flight 8 \
+  --batch-size 64 \
+  --heartbeat-seconds 5 \
+  --set output.name=brown_news_full_global_lexicon
+```
+
+每个进程启动时创建一次独立引擎，并在多句之间复用自己的范畴表和规则缓存。
+主进程负责词典查询、OOV/超长筛选，将完整候选格提交给空闲工作进程，再汇总结果。
+工作进程不复制或加载整个词典，不访问 SQLite 词典连接，也不写最终结果。
+使用 spawn 启动，工作进程内部的 BLAS/OpenMP 线程数设为 1，避免额外数值库线程池。
+该模式不使用 `search.n_threads`，每个解析进程只执行一个串行 C++ 解析调用。
+
+`--max-in-flight 8` 表示最多 8 个有效句子处于排队或解析状态，最多 4 句同时解析。
+`--batch-size 64` 仅限制主进程每轮准备的句数，不要求等这 64 句全部完成后才调度下一组。
+某句完成后立即释放其在途名额，空闲进程可以领取后续句子。
+这两个参数不限制单句图表或进程内持久缓存的大小。独立缓存会增加总内存，
+建议先用 2～4 个进程测试；减少在途数不能解决单句搜索膨胀。
+
+乱序结果暂存在输出目录下临时的 `ccg-results-*/ordered.sqlite`，
+主进程按原句序持续写入 `.jsonl` 和 `.auto`。慢句不会让已完成结果无限堆积在 Python 内存中，
+但暂存磁盘占用会随尚不能顺序输出的结果增加。进度条按完成数更新，可能领先于最终文件已写出的句数。
+临时文件在正常完成、Python 异常和 Ctrl+C 后清理；SIGKILL 或主机崩溃可能留下临时目录。
+这不是 CPU 恢复检查点，中断后重跑仍从头测评并覆盖同名输出。
+
+心跳输出为 `[CPU] Processes ...`：`submitted` 是已读取并准备的总句数（含提前失败的句子），
+`eligible` 是其中进入解析的累计句数，`completed` 包括解析完成与提前失败的句子，
+`running` 是已分配给工作进程但未返回的句数，`queued` 只统计尚未分配的有效句子。
+Linux 的 `cpu_cores`、`rss_gib`、`swap_gib` 合计主进程和工作进程；RSS 会重复计入共享页面，
+不能直接等同于物理内存的独占使用量。Windows 不提供这组多进程资源指标。
+工作进程初始化期间可能出现 `running=0`、`queued>0`。
+
+按 Ctrl+C 后，主进程停止派发、终止并回收工作进程，不等待慢句解析完成。
+工作进程异常退出会使测评失败，不会将该句冒充为语法解析失败。
+`.summary.json` 额外记录 `parser_backend`、`processes`、`max_in_flight` 和 `threads_per_process`。
+候选集合、概率权重、语法和解析率定义沿用线程模式。
+
+一条指令衔接 GPU 构建和独立进程 CPU 解析：
+
+```bash
+python -u scripts/run_full_tinystories_experiment.py \
+  --batch-size 128 --async-workers 4 \
+  --parse-backend processes --parse-processes 4 --parse-max-in-flight 8 --parse-batch-size 64
+```
+
+`--batch-size 128` 控制 GPU，`--async-workers 4` 控制 GPU 阶段概率汇总线程；
+`--parse-processes 4` 控制后续 CPU 阶段。默认仍保留线程模式，便于使用相同语料做性能对照。
+同步最新项目并运行 `python -m pip install -e .` 后，检查
+`python -m stsupport eval-lexicon --help` 应出现 `--parser-backend` 和 `--processes`。
+已有完整词典无需重新构建，可以直接运行上面的独立 CPU 命令。
+
+自定义语料只需替换 `--corpus`，例如：
+
+```bash
+python -u -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlite --corpus /mnt/datasets/my_test.jsonl --format jsonl --parser-backend processes --processes 4 --max-in-flight 8 --set output.name=my_test_processes
+```
+
+JSONL 每行可为 `{"tokens": ["Lily", "sleeps", "."]}` 或 `{"text": "Lily sleeps."}`；
+纯文本每行一句则用 `--format txt`。输出前缀不得覆盖输入文件，词典预处理设置仍须匹配。
+
 ## 验证范围
 
 已测试续传、服务端忽略 Range、短响应重试、错误 Range、哈希失败、完整 partial 恢复、
@@ -324,5 +400,10 @@ kill -TERM PID
 异步流水线已测试单组预取上限、CPU/GPU 调用端重叠、后台异常传播、
 同步/异步软计数逐元素一致，以及失败组不会推进 SQLite 检查点。
 CPU 取消已测试运行中的原生搜索收到取消通知、SIGINT 中止测评，以及取消后复用解析引擎。
+独立进程模式已验证与原生解析结果一致、跨准备批次调度、在途任务上限、顺序输出、
+自定义语料命令行、工作进程异常传播，以及 SIGINT 后工作进程和临时文件的清理。
+本机另用现有小样本词典解析源样本前 30 句：4 线程耗时 20.166 秒，4 独立进程耗时 10.326 秒，
+两组均为 30/30 成功，逐句 JSON 结果完全一致。这是一次小范围流程对照，不代表全量词典或云主机的提速比例。
+对应结果为 `output/shared_thread_smoke_20261017.*` 与 `output/independent_process_smoke_20261017.*`。
 本机使用 `python -S` 验证了下载/校验模式不依赖第三方包，并实际检查了已下载的官方训练文件。
 云主机的 CUDA 与驱动环境需要在目标机器运行 benchmark 确认。

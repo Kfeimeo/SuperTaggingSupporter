@@ -148,19 +148,24 @@ def benchmark(tagger, path, output):
     print(json.dumps(result, indent=2), flush=True)
 
 
-def cpu_command(corpus, threads=4, batch_size=4, no_progress=False):
+def cpu_command(corpus, threads=4, batch_size=4, no_progress=False, *, backend="threads", processes=4, max_in_flight=None):
     return [sys.executable, "-u", "-m", "stsupport", "eval-lexicon",
             "--lexicon", "output/tinystories_full.lexicon.sqlite", "--corpus", str(corpus),
             "--format", "jsonl", "--set", "output.name=brown_news_full_global_lexicon",
-            "--set", f"search.n_threads={threads}", "--batch-size", str(batch_size)] + (["--no-progress"] if no_progress else [])
+            "--set", f"search.n_threads={threads}", "--batch-size", str(batch_size),
+            "--parser-backend", backend, "--processes", str(processes)] + (
+                ["--max-in-flight", str(max_in_flight)] if max_in_flight is not None else []) + (["--no-progress"] if no_progress else [])
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark-only", action="store_true")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--parse-threads", type=int, default=4, help="CPU parser threads (default: 4; 0: hardware thread count)")
-    parser.add_argument("--parse-batch-size", type=int, default=4, help="target sentences per CPU parser batch (default: 4)")
+    parser.add_argument("--parse-threads", type=int, default=4, help="thread backend only: CPU parser threads (default: 4; 0: hardware count)")
+    parser.add_argument("--parse-batch-size", type=int, default=4, help="thread batch size or process-mode preparation chunk size (default: 4)")
+    parser.add_argument("--parse-backend", choices=["threads", "processes"], default="threads")
+    parser.add_argument("--parse-processes", type=int, default=4, help="independent CPU parser processes (default: 4)")
+    parser.add_argument("--parse-max-in-flight", type=int, default=None, help="queued + running eligible sentences (default: 2 * parse-processes)")
     parser.add_argument("--pipeline-depth", type=int, default=2, help="maximum CPU aggregation batches in flight (default: 2)")
     parser.add_argument("--async-workers", type=int, default=1, help="CPU aggregation threads during GPU stage (default: 1; plus one prefetch thread)")
     parser.add_argument("--no-async", action="store_true", help="disable CPU prefetch/aggregation overlap for comparison")
@@ -172,6 +177,8 @@ def parse_args(argv=None):
         parser.error("batch sizes, checkpoint size, pipeline-depth and async-workers must be positive")
     if args.parse_threads < 0:
         parser.error("parse-threads must be >= 0")
+    if args.parse_processes < 1 or (args.parse_max_in_flight is not None and args.parse_max_in_flight < args.parse_processes):
+        parser.error("require parse-processes >= 1 and parse-max-in-flight >= parse-processes")
     return args
 
 
@@ -280,8 +287,10 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         write_status(state_path, {**summary, "stage": "evaluating_brown_news", "pid": os.getpid()})
-        print(f"[3/4 CPU] Parse Brown news (threads={args.parse_threads}, batch_size={args.parse_batch_size})", flush=True)
-        run_logged(cpu_command(brown_corpus, args.parse_threads, args.parse_batch_size, args.no_progress),
+        print(f"[3/4 CPU] Parse Brown news (backend={args.parse_backend}, threads={args.parse_threads}, "
+              f"processes={args.parse_processes}, batch_size={args.parse_batch_size})", flush=True)
+        run_logged(cpu_command(brown_corpus, args.parse_threads, args.parse_batch_size, args.no_progress,
+                               backend=args.parse_backend, processes=args.parse_processes, max_in_flight=args.parse_max_in_flight),
                    output / "brown_news_full_global_lexicon.log")
         # A separate report step can also be rerun independently after completion.
         print("[4/4 REPORT] Generate experiment report", flush=True)

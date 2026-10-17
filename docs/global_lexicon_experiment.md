@@ -167,6 +167,16 @@ python -m stsupport eval-lexicon `
 
 不要把输出前缀设为输入语料的同名路径；命令会拒绝覆盖输入文件。
 
+候选规模很大时，可使用独立引擎多进程模式，保持相同词典、语法和概率权重：
+
+```bash
+python -u -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlite --corpus /mnt/datasets/my_test.jsonl --format jsonl --parser-backend processes --processes 4 --max-in-flight 8 --set output.name=my_test_processes
+```
+
+每个进程复用自己的解析缓存，主进程查询词典、动态派发和汇总；不需要重建词典。
+此时 `search.n_threads` 不参与调度，`--batch-size` 仅控制主进程每轮准备句数，无解析批次屏障。
+详见 [独立进程解析与云主机参数](data_download_and_cloud.md#独立进程解析动态派发与主进程汇总)。
+
 ## 4. 怎样解释测评指标
 
 | 指标 | 分子 / 分母 |
