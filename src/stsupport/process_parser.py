@@ -100,7 +100,29 @@ class IndependentParsers:
             connection = self.idle.pop()
             task = self.queued.popleft()
             self.busy[connection] = task[0]
-            connection.send(task)
+            try:
+                connection.send(task)
+            except (EOFError, OSError) as error:
+                raise self._failure(connection, "disconnected while receiving a task") from error
+
+    def _failure(self, connection, reason):
+        process = self.children[connection]
+        # EOF can arrive just before multiprocessing observes the exit status.
+        process.join(timeout=0.1)
+        code = process.exitcode
+        index = self.busy.get(connection)
+        task = (f"sentence.{index + 1} len={len(self.pending[index]['tokens'])} "
+                f"candidates={sum(self.pending[index]['lattice_sizes'])}" if index is not None
+                else "during initialization or while idle")
+        details = ""
+        if os.name == "posix" and code is not None and code < 0:
+            try:
+                details = f" signal={signal.Signals(-code).name}"
+            except ValueError:
+                pass
+            if code == -signal.SIGKILL:
+                details += "; SIGKILL may indicate an OOM kill or an external kill; check cgroup/kernel records"
+        return RuntimeError(f"parser worker pid={process.pid} {reason}; exitcode={code}{details}; {task}")
 
     def poll(self, timeout):
         results = []
@@ -108,14 +130,14 @@ class IndependentParsers:
         # the coordinator waiting for a missing result forever.
         for connection, process in self.children.items():
             if process.exitcode is not None and not connection.poll():
-                raise RuntimeError(f"parser worker {process.pid} exited unexpectedly (exitcode={process.exitcode})")
+                raise self._failure(connection, "exited unexpectedly")
         for connection in wait(list(self.children), timeout=timeout):
             try:
                 kind, value = connection.recv()
             except (EOFError, OSError) as error:
-                raise RuntimeError("parser worker disconnected before completing its task") from error
+                raise self._failure(connection, "disconnected before completing its task") from error
             if kind == "error":
-                raise RuntimeError(f"parser worker failed:\n{value}")
+                raise self._failure(connection, f"failed:\n{value}")
             if kind == "result":
                 index, out = value
                 if self.busy.pop(connection) != index:

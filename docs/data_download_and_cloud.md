@@ -367,6 +367,25 @@ Linux 的 `cpu_cores`、`rss_gib`、`swap_gib` 合计主进程和工作进程；
 
 按 Ctrl+C 后，主进程停止派发、终止并回收工作进程，不等待慢句解析完成。
 工作进程异常退出会使测评失败，不会将该句冒充为语法解析失败。
+断连错误会附带工作进程 PID、退出码、活动句子编号、长度和候选数；Linux 上负退出码还会标明信号。
+`SIGKILL` 可能来自 OOM killer 或外部终止，不能只凭 EOF 或 `exitcode=-9` 断定 OOM。
+当合计 RSS 已达数百 GiB 时，不应继续仅按 CPU 核数增加并发。
+独立进程减少共享锁等待，但无法消除全候选精确搜索的组合膨胀，并会复制规则缓存。
+在途上限只限制任务个数；降低它不能约束正在运行的单句图表和进程缓存。
+`buffered_results` 是磁盘暂存的已完成结果数，并非同等数量的常驻解析图表。
+
+对于 cgroup v1 云容器，可先读取内存上限、历史峰值和内核 OOM 记录：
+
+```bash
+cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes
+cat /sys/fs/cgroup/memory/memory.failcnt
+cat /sys/fs/cgroup/memory/memory.oom_control
+dmesg -T | grep -Ei 'out of memory|oom-kill|killed process' | tail -20
+```
+
+`memory.failcnt` 统计触及内存限额的次数，不能直接当作 OOM 杀进程次数；内核日志也可能因容器权限不可读。
+不要把资源耗尽、超时或被杀的句子计为 `no_derivation`，它们没有完成精确搜索。
 `.summary.json` 额外记录 `parser_backend`、`processes`、`max_in_flight` 和 `threads_per_process`。
 候选集合、概率权重、语法和解析率定义沿用线程模式。
 

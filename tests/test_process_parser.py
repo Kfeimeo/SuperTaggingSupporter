@@ -38,6 +38,12 @@ def _crashing_worker(connection, grammar, seen_rules):
     os._exit(7)
 
 
+def _busy_crashing_worker(connection, grammar, seen_rules):
+    connection.send(("ready", None))
+    connection.recv()
+    os._exit(7)
+
+
 def _lex():
     lex = GlobalLexicon(["NP", "S[dcl]\\NP", "."])
     lex.add(["Lily", "sleeps", "."], np.eye(3))
@@ -105,10 +111,19 @@ def test_worker_crash_fails_and_cleans_up(tmp_path, monkeypatch):
     import stsupport.process_parser as module
     monkeypatch.setattr(module, "_worker", _crashing_worker)
     initial = _children()
-    with pytest.raises(RuntimeError, match="worker"):
+    with pytest.raises(RuntimeError, match="exitcode=7"):
         list(evaluate_processes(GrammarConfig(), _lex(), [["Lily", "sleeps"]],
                                 processes=2, max_in_flight=2, spool_dir=tmp_path))
     assert _children() == initial
+    assert not list(tmp_path.iterdir())
+
+
+def test_worker_crash_identifies_active_sentence(tmp_path, monkeypatch):
+    import stsupport.process_parser as module
+    monkeypatch.setattr(module, "_worker", _busy_crashing_worker)
+    with pytest.raises(RuntimeError, match=r"pid=\d+.*exitcode=7.*sentence\.1 len=2 candidates=2"):
+        list(evaluate_processes(GrammarConfig(), _lex(), [["Lily", "sleeps"]],
+                                processes=1, max_in_flight=1, spool_dir=tmp_path))
     assert not list(tmp_path.iterdir())
 
 
