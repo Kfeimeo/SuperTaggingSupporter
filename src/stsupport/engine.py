@@ -36,8 +36,17 @@ class CKYEngine:
         out = self._engine.parse(list(tokens), lattice)
         return out if out["ok"] else None
 
-    def parse_raw(self, tokens: Sequence[str], lattice: Lattice) -> dict[str, Any]:
-        return self._engine.parse(list(tokens), lattice)
+    def new_cancellation_token(self):
+        from stsupport import _ccgcky
+
+        if not hasattr(_ccgcky, "ParseCancellation"):
+            raise RuntimeError("C++ parser extension is outdated; rebuild with: python -m pip install -e .")
+        return _ccgcky.ParseCancellation()
+
+    def parse_raw(self, tokens: Sequence[str], lattice: Lattice, *, cancellation=None) -> dict[str, Any]:
+        if cancellation is None:
+            return self._engine.parse(list(tokens), lattice)
+        return self._engine.parse(list(tokens), lattice, cancellation)
 
     def parse_batch(self, tokens: Sequence[Sequence[str]], lattices: Sequence[Lattice], n_threads: int = 0) -> list[dict[str, Any]]:
         return self._engine.parse_batch([list(t) for t in tokens], list(lattices), n_threads)

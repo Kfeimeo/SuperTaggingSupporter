@@ -7,7 +7,9 @@
 // derivation whose root matches a root category is returned.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <exception>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -66,9 +68,27 @@ struct ParseOutput {
 
 using Lattice = std::vector<std::vector<std::pair<std::string, double>>>;
 
+class ParseCancelled : public std::exception {
+public:
+    const char* what() const noexcept override { return "parsing cancelled"; }
+};
+
+// One token per evaluation batch, shared by its independent parsers. Checking
+// it never needs the Python GIL or a grammar/cache lock.
+class ParseCancellation {
+public:
+    void cancel() { requested_.store(true, std::memory_order_relaxed); }
+    void check() const {
+        if (requested_.load(std::memory_order_relaxed)) throw ParseCancelled();
+    }
+private:
+    std::atomic<bool> requested_{false};
+};
+
 class Parser {
 public:
-    Parser(CategoryStore& store, Grammar& grammar, Lexicon& lexicon);
+    Parser(CategoryStore& store, Grammar& grammar, Lexicon& lexicon,
+           const ParseCancellation* cancellation = nullptr);
     ParseOutput parse(const std::vector<std::string>& tokens, const Lattice& lattice);
 
 private:
@@ -101,7 +121,9 @@ private:
     void unary_closure(Cell& cell);
     void finalize_cell(Cell& cell);
     int emit(const std::vector<std::string>& tokens, const Lattice& lattice, std::int32_t idx, ParseOutput& out);
+    void check_cancelled() const { if (cancellation_) cancellation_->check(); }
 
+    const ParseCancellation* cancellation_;
     CategoryStore& store_;
     Grammar& grammar_;
     Lexicon& lexicon_;

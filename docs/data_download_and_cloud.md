@@ -290,11 +290,39 @@ swap 活跃可能表示换页，线程长时间等待 futex 可能涉及锁等�
 减少线程数可降低同时展开的解析图表数量，并帮助判断并发内存和锁竞争。
 使用 beam、过滤候选或缩短句长会改变覆盖测评条件，应作为独立实验记录。
 
+### Ctrl+C 中止 CPU 测评
+
+CPU 测评支持协作取消：按 Ctrl+C 后，主线程先通知正在运行的 C++ 解析循环退出，
+取消尚未开始的句子，再等待工作线程清理图表。图表较大或线程正在执行单次规则运算时，
+清理仍可能需要一些时间。词典只读，不受中止影响；CPU 测评仍没有句子级恢复，
+同一命令重跑会重新测评并覆盖同名输出，未完成批次也不会写入结果文件。
+
+旧版本在 Ctrl+C 后直接等待线程池，而 C++ 解析没有取消检查，可能一直等待慢句结束。
+这次修复同时修改了 `cpp/parser.hpp`、`cpp/parser.cpp`、`cpp/bindings.cpp`、
+`src/stsupport/engine.py` 和 `src/stsupport/lexicon_experiment.py`。
+同步最新项目后必须重新编译安装 C++ 扩展，仅替换 Python 文件无法启用：
+
+```bash
+python -m pip install -e .
+python -c "from stsupport import _ccgcky; print('native cancellation:', hasattr(_ccgcky, 'ParseCancellation'))"
+```
+
+检查结果应为 `native cancellation: True`，然后启动新的测评进程。
+对于已经运行且无法响应 Ctrl+C 的旧进程，在另一终端先确认具体 PID，再发送 SIGTERM：
+
+```bash
+pgrep -af 'stsupport eval-lexicon'
+kill -TERM PID
+```
+
+这里的 `PID` 替换为确认过的测评进程 ID。若仍未退出，再使用 `kill -KILL PID`。
+
 ## 验证范围
 
 已测试续传、服务端忽略 Range、短响应重试、错误 Range、哈希失败、完整 partial 恢复、
 离线校验、自定义目录，以及新主机缺少历史基线时的报告生成。
 异步流水线已测试单组预取上限、CPU/GPU 调用端重叠、后台异常传播、
 同步/异步软计数逐元素一致，以及失败组不会推进 SQLite 检查点。
+CPU 取消已测试运行中的原生搜索收到取消通知、SIGINT 中止测评，以及取消后复用解析引擎。
 本机使用 `python -S` 验证了下载/校验模式不依赖第三方包，并实际检查了已下载的官方训练文件。
 云主机的 CUDA 与驱动环境需要在目标机器运行 benchmark 确认。

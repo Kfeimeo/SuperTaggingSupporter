@@ -39,8 +39,9 @@ const LexCandidate& Lexicon::lookup(const std::string& text) {
 // Parser
 // ---------------------------------------------------------------------------
 
-Parser::Parser(CategoryStore& store, Grammar& grammar, Lexicon& lexicon)
-    : store_(store), grammar_(grammar), lexicon_(lexicon) {}
+Parser::Parser(CategoryStore& store, Grammar& grammar, Lexicon& lexicon,
+               const ParseCancellation* cancellation)
+    : cancellation_(cancellation), store_(store), grammar_(grammar), lexicon_(lexicon) {}
 
 std::uint64_t Parser::item_key(CatId cat, NfKind kind, int degree) {
     return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(cat)) << 8) |
@@ -81,6 +82,7 @@ void Parser::unary_closure(Cell& cell) {
     const RuleConfig& cfg = grammar_.config();
     std::vector<std::int32_t> work(cell.items.begin(), cell.items.end());
     while (!work.empty()) {
+        check_cancelled();
         std::int32_t idx = work.back();
         work.pop_back();
         const Item src = pool_[idx];  // copy: pool_ may grow below
@@ -121,6 +123,7 @@ void Parser::finalize_cell(Cell& cell) {
 }
 
 ParseOutput Parser::parse(const std::vector<std::string>& tokens, const Lattice& lattice) {
+    check_cancelled();
     ParseOutput out;
     const int n = static_cast<int>(tokens.size());
     out.chosen.assign(n, -1);
@@ -137,6 +140,7 @@ ParseOutput Parser::parse(const std::vector<std::string>& tokens, const Lattice&
         Cell& cell = cell_at(i, i + 1);
         const auto& cands = lattice[i];
         for (std::size_t ci = 0; ci < cands.size(); ++ci) {
+            check_cancelled();
             const LexCandidate& lex = lexicon_.lookup(cands[ci].first);
             if (!lex.valid) continue;
             Item item;
@@ -157,6 +161,7 @@ ParseOutput Parser::parse(const std::vector<std::string>& tokens, const Lattice&
     // Binary spans
     for (int len = 2; len <= n; ++len) {
         for (int i = 0; i + len <= n; ++i) {
+            check_cancelled();
             const int j = i + len;
             Cell& cell = cell_at(i, j);
             for (int k = i + 1; k < j; ++k) {
@@ -166,6 +171,7 @@ ParseOutput Parser::parse(const std::vector<std::string>& tokens, const Lattice&
                 for (std::int32_t li : lc.items) {
                     const Item L = pool_[li];
                     for (std::int32_t ri : rc.items) {
+                        check_cancelled();
                         const Item R = pool_[ri];
                         const auto& results = grammar_.binary(L.cat, R.cat);
                         if (results.empty()) continue;
@@ -205,6 +211,7 @@ ParseOutput Parser::parse(const std::vector<std::string>& tokens, const Lattice&
     out.root_items = root_cell.items.size();
     std::int32_t best = -1;
     for (std::int32_t idx : root_cell.items) {
+        check_cancelled();
         const Item& it = pool_[idx];
         out.root_cell_cats.push_back(store_.str(it.cat));
         if (!grammar_.is_root(it.cat)) continue;
@@ -221,6 +228,7 @@ ParseOutput Parser::parse(const std::vector<std::string>& tokens, const Lattice&
 
 // Convert the backpointer tree into output nodes; returns the node index.
 int Parser::emit(const std::vector<std::string>& tokens, const Lattice& lattice, std::int32_t idx, ParseOutput& out) {
+    check_cancelled();
     const Item& it = pool_[idx];
     if (it.rule == Rule::Lex || it.rule == Rule::Chain) {
         const LexCandidate& lex = lexicon_.lookup(lattice[it.start][it.cand].first);

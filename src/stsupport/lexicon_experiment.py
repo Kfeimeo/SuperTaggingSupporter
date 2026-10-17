@@ -162,8 +162,13 @@ def evaluate_batch(engine, lex, sentences, *, max_tokens=80, n_threads=0, min_su
             # parse_raw releases the GIL in C++; each call has its own Parser.
             # The shared engine keeps the same synchronized rule/category caches.
             t0 = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="ccg-parse") as pool:
-                pending = {pool.submit(engine.parse_raw, sentences[i], lattice): i for i, lattice in zip(active, lattices)}
+            cancellation = engine.new_cancellation_token() if hasattr(engine, "new_cancellation_token") else None
+            pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="ccg-parse")
+            pending = {}
+            try:
+                for i, lattice in zip(active, lattices):
+                    kwargs = {"cancellation": cancellation} if cancellation is not None else {}
+                    pending[pool.submit(engine.parse_raw, sentences[i], lattice, **kwargs)] = i
                 sizes = [size for record in records for size in record["lattice_sizes"]]
                 while pending:
                     if on_wait is not None:
@@ -177,10 +182,22 @@ def evaluate_batch(engine, lex, sentences, *, max_tokens=80, n_threads=0, min_su
                                  "max_candidates": max(sizes, default=0),
                                  "examples": [{"index": i, "tokens": len(sentences[i]),
                                                "candidates": sum(records[i]["lattice_sizes"])} for i in examples]})
-                    done, _ = wait(pending, timeout=heartbeat_seconds, return_when=FIRST_COMPLETED)
+                    # Short waits also let Windows/Python handle Ctrl+C promptly;
+                    # CLI heartbeat output has its own interval throttle.
+                    done, _ = wait(pending, timeout=min(heartbeat_seconds, 0.2), return_when=FIRST_COMPLETED)
                     for future in done:
                         index = pending.pop(future)
                         fill(index, future.result())
+            except BaseException:
+                # Cancel native loops BEFORE joining the executor. Cancelling
+                # Future objects alone cannot stop an already running C++ call.
+                if cancellation is not None:
+                    cancellation.cancel()
+                for future in pending:
+                    future.cancel()
+                raise
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
     return records
 
 

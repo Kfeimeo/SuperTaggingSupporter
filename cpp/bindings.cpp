@@ -25,6 +25,9 @@ auto guarded(F&& f) -> decltype(f()) {
         return f();
     } catch (const py::error_already_set&) {
         throw;
+    } catch (const ParseCancelled& e) {
+        PyErr_SetString(PyExc_InterruptedError, e.what());
+        throw py::error_already_set();
     } catch (const std::invalid_argument& e) {
         PyErr_SetString(PyExc_ValueError, e.what());
         throw py::error_already_set();
@@ -109,12 +112,13 @@ public:
         });
     }
 
-    py::dict parse(const std::vector<std::string>& tokens, const Lattice& lattice) {
+    py::dict parse(const std::vector<std::string>& tokens, const Lattice& lattice,
+                   const std::shared_ptr<ParseCancellation>& cancellation) {
         return guarded([&] {
             ParseOutput out;
             {
                 py::gil_scoped_release release;
-                Parser parser(*store_, *grammar_, *lexicon_);
+                Parser parser(*store_, *grammar_, *lexicon_, cancellation.get());
                 out = parser.parse(tokens, lattice);
             }
             return output_to_py(out);
@@ -194,9 +198,12 @@ private:
 
 PYBIND11_MODULE(_ccgcky, m) {
     m.doc() = "Viterbi CKY over CCG supertag lattices (Eisner normal form)";
+    py::class_<ParseCancellation, std::shared_ptr<ParseCancellation>>(m, "ParseCancellation")
+        .def(py::init<>())
+        .def("cancel", &ParseCancellation::cancel);
     py::class_<Engine>(m, "Engine")
         .def(py::init<const py::dict&>(), py::arg("config"))
-        .def("parse", &Engine::parse, py::arg("tokens"), py::arg("lattice"),
+        .def("parse", &Engine::parse, py::arg("tokens"), py::arg("lattice"), py::arg("cancellation") = nullptr,
              "Parse one sentence; lattice[i] = [(category, logp), ...] for token i.")
         .def("parse_batch", &Engine::parse_batch, py::arg("tokens"), py::arg("lattices"), py::arg("n_threads") = 0,
              "Parse many sentences in parallel C++ threads.")
