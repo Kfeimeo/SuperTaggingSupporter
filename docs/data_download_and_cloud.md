@@ -240,9 +240,15 @@ python -u scripts/run_full_tinystories_experiment.py --data-dir /mnt/datasets --
 
 GPU 总进度按源文件已完成并提交检查点的字节量计，不代表故事数或句数百分比；
 右侧还显示当前组的超标注句子进度。恢复运行时总进度从已保存偏移继续，ETA 按恢复后的处理速度估计。
-CPU 总进度按目标语料的有效句数计，包括解析失败、OOV 和超长跳过的句子，按批次完成后更新。
+CPU 总进度按目标语料的有效句数计，包括解析失败、OOV 和超长跳过的句子，每完成一句就更新。
+已完成的句子不必等待同批慢句才显示进度；结果文件仍按原语料顺序、按批写入。
 CPU 开始前会先扫描目标语料以确定总句数，不会一次将整个语料载入内存。
-单批解析尚未完成时，CPU 进度条会暂时停留在上一批的计数。
+即使没有句子完成，也会定时输出 `[CPU] Batch ...` 状态，默认每 10 秒一次，可用
+`eval-lexicon --heartbeat-seconds 5` 调整。状态包括正在处理/排队的句数、候选规模，
+以及部分活动句子的 ID、长度和候选总数。这里的 running 表示任务已经在线程中执行，
+不代表该线程一直占满 CPU。
+Linux 还显示进程 RSS、swap（单位 GiB），以及两次状态输出之间的实际 CPU 核数消耗：
+`cpu_cores=1.0` 约等于占满一个逻辑核，不能直接当作整台主机的百分比。
 
 自动调用的 CPU 子进程输出会实时显示在终端，同时保存在
 `output/brown_news_full_global_lexicon.log`。GPU 的 JSON 检查点日志和状态文件仍然保留。
@@ -254,6 +260,35 @@ CPU 开始前会先扫描目标语料以确定总句数，不会一次将整个�
 python -u scripts/run_full_tinystories_experiment.py --data-dir /mnt/datasets --batch-size 128 --no-progress
 python -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlite --corpus /mnt/datasets/brown_news.jsonl --set output.name=brown_news_full_global_lexicon --no-progress
 ```
+
+### CPU 长时间停在 0% 的诊断
+
+全量词典会合并同一词在全部源语料中的候选，常用词的集合可能远大于构建时单次出现的 `k=8`。
+精确、无 beam 的 CKY 图表和共享规则缓存可能随之显著膨胀。
+旧版本还要等待整批返回才更新进度；新版本按句完成更新，并提供上述状态输出。
+这项显示改进不会自动缩小搜索空间。
+
+先用独立输出名、小范围和单线程诊断，保留原实验设置：
+
+```bash
+python -u -m stsupport eval-lexicon --lexicon output/tinystories_full.lexicon.sqlite --corpus /mnt/datasets/brown_news.jsonl --limit 16 --set search.n_threads=1 --batch-size 1 --heartbeat-seconds 5 --set output.name=cpu_probe
+```
+
+`cpu_probe` 只用于诊断，不作为全量语料覆盖结论。候选多的单句本身也可能耗时很长。
+如果 CPU 很低而内存很高，可以在另一终端观察：
+
+```bash
+free -h
+vmstat 1 5
+pgrep -af 'stsupport eval-lexicon'
+# 将下面 PID 换成上一步显示的测评进程 ID。
+ps -L -p PID -o pid,tid,pcpu,stat,wchan:24,comm
+```
+
+swap 活跃可能表示换页，线程长时间等待 futex 可能涉及锁等待；需要结合多个采样判断。
+主机核数较多时，一个进程占用几个核也可能表现为较低的整机百分比。
+减少线程数可降低同时展开的解析图表数量，并帮助判断并发内存和锁竞争。
+使用 beam、过滤候选或缩短句长会改变覆盖测评条件，应作为独立实验记录。
 
 ## 验证范围
 

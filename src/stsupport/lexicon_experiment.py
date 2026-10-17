@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
+import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter
 from dataclasses import asdict
 from itertools import islice
@@ -17,6 +21,20 @@ from stsupport.engine import leaf_categories, render_auto
 from stsupport.lexicon import GlobalLexicon
 
 logger = logging.getLogger(__name__)
+
+
+def process_resources():
+    """Dependency-free Linux RSS/swap diagnostics; CPU time also works elsewhere."""
+    result = {"cpu_seconds": time.process_time()}
+    try:
+        with Path("/proc/self/status").open(encoding="utf-8") as source:
+            for line in source:
+                key, _, value = line.partition(":")
+                if key in {"VmRSS", "VmSwap"}:
+                    result["rss_gib" if key == "VmRSS" else "swap_gib"] = int(value.split()[0]) / (1024 ** 2)
+    except (OSError, ValueError):
+        pass
+    return result
 
 
 def _protect_inputs(inputs, outputs):
@@ -96,7 +114,8 @@ def cmd_build_lexicon(args):
     return 0
 
 
-def evaluate_batch(engine, lex, sentences, *, max_tokens=80, n_threads=0, min_support=1, weighting="mean"):
+def evaluate_batch(engine, lex, sentences, *, max_tokens=80, n_threads=0, min_support=1, weighting="mean",
+                   on_complete=None, on_wait=None, heartbeat_seconds=10):
     """Parse full dictionary lattices; never prune or consult a supertagger."""
     records, active, lattices = [], [], []
     for tokens in sentences:
@@ -117,16 +136,51 @@ def evaluate_batch(engine, lex, sentences, *, max_tokens=80, n_threads=0, min_su
             active.append(len(records))
             lattices.append(lattice)
         records.append(record)
-    if active:
-        parsed = engine.parse_batch([sentences[i] for i in active], lattices, n_threads)
-        if len(parsed) != len(active):
-            raise ValueError("parser returned the wrong number of results")
-        for i, out in zip(active, parsed):
-            if out["ok"]:
-                records[i].update(status="parsed", root_cat=out["root_cat"], final_tags=leaf_categories(out),
+        if record["reason"] is not None and on_complete is not None:
+            on_complete(len(records) - 1, record)
+
+    def fill(index, out):
+        if out["ok"]:
+            records[index].update(status="parsed", root_cat=out["root_cat"], final_tags=leaf_categories(out),
                                   logprob=float(out["score"]), auto=render_auto(out))
-            else:
-                records[i].update(reason="no_derivation", root_cell_cats=list(out["root_cell_cats"]))
+        else:
+            records[index].update(reason="no_derivation", root_cell_cats=list(out["root_cell_cats"]))
+        if on_complete is not None:
+            on_complete(index, records[index])
+
+    if active:
+        if on_complete is None and on_wait is None:
+            parsed = engine.parse_batch([sentences[i] for i in active], lattices, n_threads)
+            if len(parsed) != len(active):
+                raise ValueError("parser returned the wrong number of results")
+            for i, out in zip(active, parsed):
+                fill(i, out)
+        else:
+            if heartbeat_seconds <= 0:
+                raise ValueError("heartbeat_seconds must be positive")
+            threads = min(len(active), n_threads if n_threads > 0 else (os.cpu_count() or 1))
+            # parse_raw releases the GIL in C++; each call has its own Parser.
+            # The shared engine keeps the same synchronized rule/category caches.
+            t0 = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="ccg-parse") as pool:
+                pending = {pool.submit(engine.parse_raw, sentences[i], lattice): i for i, lattice in zip(active, lattices)}
+                sizes = [size for record in records for size in record["lattice_sizes"]]
+                while pending:
+                    if on_wait is not None:
+                        running = [i for future, i in pending.items() if future.running()]
+                        examples = sorted(running, key=lambda i: sum(records[i]["lattice_sizes"]), reverse=True)[:3]
+                        on_wait({"elapsed_seconds": time.perf_counter() - t0,
+                                 "running": len(running), "queued": sum(not f.running() and not f.done() for f in pending),
+                                 "eligible": len(active), "batch_sentences": len(sentences),
+                                 "max_tokens": max(map(len, sentences)),
+                                 "avg_candidates": sum(sizes) / max(1, len(sizes)),
+                                 "max_candidates": max(sizes, default=0),
+                                 "examples": [{"index": i, "tokens": len(sentences[i]),
+                                               "candidates": sum(records[i]["lattice_sizes"])} for i in examples]})
+                    done, _ = wait(pending, timeout=heartbeat_seconds, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        index = pending.pop(future)
+                        fill(index, future.result())
     return records
 
 
@@ -136,8 +190,10 @@ def cmd_eval_lexicon(args):
     cfg = _setup(args)
     if cfg.grammar.use_seen_rules and cfg.grammar.seen_rules_path in (None, "model"):
         raise ValueError("tagger-free evaluation needs an explicit grammar.seen_rules_path when use_seen_rules=true")
-    if cfg.search.max_tokens < 1 or args.min_support < 1:
-        raise ValueError("max_tokens and min_support must be positive")
+    if cfg.search.max_tokens < 1 or args.min_support < 1 or args.batch_size < 1:
+        raise ValueError("max_tokens, min_support and batch_size must be positive")
+    if not math.isfinite(args.heartbeat_seconds) or args.heartbeat_seconds <= 0:
+        raise ValueError("heartbeat_seconds must be finite and positive")
     lex = GlobalLexicon.load(args.lexicon)
     source = lex.metadata.get("source", {})
     if "drop_quotes" in source and source["drop_quotes"] != cfg.corpus.drop_quotes:
@@ -152,6 +208,7 @@ def cmd_eval_lexicon(args):
     counts, reasons, oov_counts = Counter(), Counter(), Counter()
     types = set()
     candidate_pairs = 0
+    live_counts = Counter()
     logger.info("[CPU] Counting target sentences for parsing progress")
     target_total = sum(1 for _ in _stream(cfg))
     t0 = time.perf_counter()
@@ -160,8 +217,40 @@ def cmd_eval_lexicon(args):
             Path(f"{prefix}.jsonl").open("w", encoding="utf-8") as jsonl, \
             Path(f"{prefix}.auto").open("w", encoding="utf-8") as auto:
         for chunk in _batches(_stream(cfg), args.batch_size):
+            batch_start = counts["sentences"]
+            last_heartbeat = float("-inf")
+            last_cpu_sample = (time.monotonic(), time.process_time())
+
+            def completed(index, record):
+                live_counts[record["status"]] += 1
+                bar.set_postfix(parsed=live_counts["parsed"], failed=live_counts["fail"],
+                                skipped=live_counts["skipped"], refresh=False)
+                bar.update(1)
+
+            def heartbeat(info):
+                nonlocal last_heartbeat, last_cpu_sample
+                bar.set_postfix(parsed=live_counts["parsed"], failed=live_counts["fail"], skipped=live_counts["skipped"],
+                                running=info["running"], queued=info["queued"], max_cands=info["max_candidates"], refresh=False)
+                now = time.monotonic()
+                if now - last_heartbeat >= args.heartbeat_seconds:
+                    resources = process_resources()
+                    interval = now - last_cpu_sample[0]
+                    cores = (resources["cpu_seconds"] - last_cpu_sample[1]) / interval if interval >= 0.1 else None
+                    resource_text = f" cpu_cores={cores:.2f}" if cores is not None else ""
+                    resource_text += "".join(f" {name}={resources[name]:.2f}" for name in ("rss_gib", "swap_gib") if name in resources)
+                    examples = "; ".join(f"sentence.{batch_start + item['index'] + 1} len={item['tokens']} candidates={item['candidates']}"
+                                         for item in info["examples"])
+                    tqdm.write(f"[CPU] Batch {batch_start + 1}-{batch_start + len(chunk)}: "
+                               f"elapsed={info['elapsed_seconds']:.1f}s running={info['running']} queued={info['queued']} "
+                               f"eligible={info['eligible']} avg_cands/token={info['avg_candidates']:.1f} "
+                               f"max_cands/token={info['max_candidates']}{resource_text}; {examples}", file=sys.stderr)
+                    bar.refresh()
+                    last_heartbeat = now
+                    last_cpu_sample = (now, resources["cpu_seconds"])
+
             records = evaluate_batch(engine, lex, chunk, max_tokens=cfg.search.max_tokens,
-                                     n_threads=cfg.search.n_threads, min_support=args.min_support, weighting=args.weighting)
+                                     n_threads=cfg.search.n_threads, min_support=args.min_support, weighting=args.weighting,
+                                     on_complete=completed, on_wait=heartbeat, heartbeat_seconds=args.heartbeat_seconds)
             for record in records:
                 tokens = record["tokens"]
                 counts["sentences"] += 1
@@ -184,7 +273,6 @@ def cmd_eval_lexicon(args):
                     auto.write(f"ID={record['id']} PARSER=GLOBALLEXICON STATUS={record['status']} "
                                f"NUMPARSE={int(record['status'] == 'parsed')}\n{record['auto'] or ''}\n")
             bar.set_postfix(parsed=counts["parsed"], failed=counts["fail"], skipped=counts["skipped"], refresh=False)
-            bar.update(len(records))
             if args.no_progress:
                 logger.info("[CPU] evaluated %d/%d sentences: %d parsed, %d failed, %d skipped", counts["sentences"],
                             target_total, counts["parsed"], counts["fail"], counts["skipped"])
@@ -241,6 +329,7 @@ def register_commands(sub):
             command.add_argument("--device", default=None)
         else:
             command.add_argument("--no-progress", action="store_true", help="disable CPU parsing tqdm bar")
+            command.add_argument("--heartbeat-seconds", type=float, default=10, help="CPU running/queued status interval (default: 10s)")
             command.add_argument("--min-support", type=int, default=1, help="minimum selected occurrences of each word-category pair")
             command.add_argument("--weighting", choices=["mean", "uniform"], default="mean")
             command.add_argument("--batch-size", type=int, default=16, help="sentences per parser batch")
